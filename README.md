@@ -1,6 +1,8 @@
 
 # AttackFormer: Forbidden-Aware Adversarial Generation
 
+<img width="1987" height="2787" alt="image" src="https://github.com/user-attachments/assets/4e5851d3-f92c-4481-9061-06b7eb9c6151" />
+
 Guard使用：使用Guard（目前实验中所用的是阿里的XGuard），若从通用性角度而言可以考虑换成其他的开源Guard
 ## 架构特点
 

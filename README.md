@@ -2,7 +2,8 @@
 
 <img width="1987" height="2787" alt="image" src="https://github.com/user-attachments/assets/3309e9f0-46dd-4d59-923a-f181902cb7cf" />
 
-Guard Usage: Currently using XGuard (Alibaba) in experiments. For general-purpose applications, consider switching to other open-source Guard alternatives.
+Guard Usage: Currently using XGuard (Alibaba) in experiments,the research I intended for is generative Guard like Xguard provided by Alibaba-AAIG.
+For real attack, the guard can be open-sourced model after alignment training, or the real guard in applications if you like.
 
 ## Architecture Highlights
 

@@ -1,8 +1,6 @@
 
 # AttackFormer: Forbidden-Aware Adversarial Generation
 
-改进版 AttackFormer 实现，融合 Design I (RL-Guided Diffusion) 和 Design II (Conditioned Discrete Diffusion) 的优势。
-
 ## 架构特点
 
 - **两阶段训练**: 离线离散扩散预训练 + 在线 PPO 微调

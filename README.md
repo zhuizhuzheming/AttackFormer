@@ -162,6 +162,10 @@ If you use this code, please cite:
 }
 ```
 
+## Thanks
+Thanks for Kimi K2.5 for giving complete implementation of the model and idea based on my hand-writing model architecture.
+
+
 ## Disclaimer
 
 This code is for academic research and security testing purposes only. Using this code for unauthorized attack testing may violate relevant laws and regulations. Please ensure usage in legally authorized environments.

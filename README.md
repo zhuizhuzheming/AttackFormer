@@ -158,7 +158,7 @@ R = α · I[Jailbreak Success] - β · XGuardConfidence + γ · ForbiddenDistanc
 ```bibtex
 @article{attackformer2024,
   title={AttackFormer: Forbidden-Aware Adversarial Generation via Hybrid RL-Diffusion},
-  year={2024}
+  year={2026}
 }
 ```
 

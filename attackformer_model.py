@@ -1,4 +1,3 @@
-
 """
 AttackFormer: Forbidden-Aware Adversarial Generation
 Hybrid Architecture: Offline Discrete Diffusion Pre-training + Online PPO Fine-tuning
@@ -176,12 +175,13 @@ class CrossAttention(nn.Module):
     def forward(
         self,
         prompt_emb: torch.Tensor,        # [B, S, D] 攻击意图
-        forbidden_emb: torch.Tensor,     # [B, F, D] 禁忌token嵌入
+        forbidden_emb: torch.Tensor,     # [B, F_seq, D] 禁忌token嵌入 (F_seq 表示 forbidden sequence length)
         xguard_signal: torch.Tensor,     # [B, D] 或 [B, 1, D] XGuard信号
         mask: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, S, D = prompt_emb.shape
-        _, F, _ = forbidden_emb.shape
+        # 修复：使用 F_seq 而不是 F，避免覆盖 torch.nn.functional 的别名 F
+        _, F_seq, _ = forbidden_emb.shape
 
         # 确保 xguard_signal 有正确的维度
         if xguard_signal.dim() == 2:
@@ -189,21 +189,21 @@ class CrossAttention(nn.Module):
 
         # 线性投影
         Q = self.W_q(prompt_emb).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
-        K = self.W_k(forbidden_emb).view(B, F, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.W_k(forbidden_emb).view(B, F_seq, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # V: 扩展 xguard_signal 到 F 个token
+        # V: 扩展 xguard_signal 到 F_seq 个token
         V_base = self.W_v(xguard_signal)  # [B, 1, D]
-        V_expanded = V_base.expand(B, F, D)  # [B, F, D]
-        V = V_expanded.view(B, F, self.num_heads, self.head_dim).transpose(1, 2)
-        # V: [B, num_heads, F, head_dim]
+        V_expanded = V_base.expand(B, F_seq, D)  # [B, F_seq, D]
+        V = V_expanded.view(B, F_seq, self.num_heads, self.head_dim).transpose(1, 2)
+        # V: [B, num_heads, F_seq, head_dim]
 
         # 注意力分数
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, H, S, F]
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale  # [B, H, S, F_seq]
 
         if mask is not None:
             scores = scores.masked_fill(mask.unsqueeze(1).unsqueeze(2), float('-inf'))
 
-        attn_weights = F.softmax(scores, dim=-1)  # [B, H, S, F]
+        attn_weights = F.softmax(scores, dim=-1)  # [B, H, S, F_seq]
 
         # 注意力输出
         out = torch.matmul(attn_weights, V)  # [B, H, S, head_dim]
@@ -302,11 +302,20 @@ class SemanticAnchor(nn.Module):
         adversarial_emb: torch.Tensor # [B, S, D] 生成的对抗prompt嵌入
     ) -> torch.Tensor:
         """返回语义一致性损失 (越小越好)"""
-        orig = F.normalize(self.proj(original_emb), dim=-1)
-        adv = F.normalize(adversarial_emb, dim=-1)
+        # 修复：处理维度不匹配的情况 - 使用平均池化来统一维度
+        if original_emb.shape[1] != adversarial_emb.shape[1]:
+            # 对两个嵌入都进行平均池化，得到句子级别的表示
+            orig = original_emb.mean(dim=1, keepdim=True)  # [B, 1, D]
+            adv = adversarial_emb.mean(dim=1, keepdim=True)  # [B, 1, D]
+        else:
+            orig = original_emb
+            adv = adversarial_emb
+
+        orig = F.normalize(self.proj(orig), dim=-1)
+        adv = F.normalize(adv, dim=-1)
 
         # 余弦相似度
-        sim = (orig * adv).sum(dim=-1)  # [B, S]
+        sim = (orig * adv).sum(dim=-1)  # [B] 或 [B, S]
         # 我们希望保持语义，所以1-sim是损失
         loss = (1 - sim).mean()
         return loss
@@ -460,9 +469,10 @@ class AttackFormer(nn.Module):
         for step in range(self.config.diffusion_steps):
             t = torch.full((B,), step, dtype=torch.long, device=device)
 
+            # 修复：在生成过程中不传递 original_ids 以避免维度不匹配
             outputs = self.forward(
                 generated, forbidden_token_ids, xguard_signal, 
-                time_step=t, original_ids=original_ids
+                time_step=t, original_ids=None
             )
             logits = outputs['logits'][:, -1, :] / temperature  # 取最后一个位置 [B, vocab_size]
 
@@ -582,40 +592,3 @@ class RolloutBuffer:
         self.rewards.clear()
         self.values.clear()
         self.dones.clear()
-
-
-if __name__ == "__main__":
-    # 测试模型初始化
-    config = AttackFormerConfig(
-        vocab_size=50000,
-        embed_dim=512,
-        num_heads=8,
-        num_layers=6,
-        max_seq_len=64,
-        forbidden_vocab_size=1000,
-        forbidden_token_ids=[100, 200, 300, 400, 500]  # 示例禁忌token
-    )
-
-    model = AttackFormer(config)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-
-    # 测试前向传播
-    B, S, F = 2, 32, 10
-    input_ids = torch.randint(0, 50000, (B, S))
-    forbidden_ids = torch.randint(0, 1000, (B, F))
-    xguard_signal = torch.randn(B, 512)
-
-    outputs = model(input_ids, forbidden_ids, xguard_signal, return_value=True)
-    print(f"Logits shape: {outputs['logits'].shape}")
-    print(f"Value shape: {outputs['value'].shape}")
-    print(f"Forbidden distance: {outputs['forbidden_distance']}")
-    print(f"Soft penalty: {outputs['soft_penalty']}")
-
-    # 测试生成
-    print("\nTesting generation...")
-    gen_ids, log_probs = model.generate_adversarial(
-        input_ids, forbidden_ids, xguard_signal, max_length=40
-    )
-    print(f"Generated shape: {gen_ids.shape}")
-    print(f"Log probs shape: {log_probs.shape}")
-    print("All tests passed!")

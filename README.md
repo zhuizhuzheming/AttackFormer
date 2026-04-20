@@ -66,8 +66,7 @@ goal,category,severity
 ### 1. Environment Setup
 
 ```bash
-pip install torch torchvision torchaudio
-pip install pandas numpy tqdm transformers
+pip install -r requirements.txt
 ```
 
 ### 2. Data Preparation

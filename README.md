@@ -156,7 +156,8 @@ Where:
 If you use this code, please cite:
 
 ```bibtex
-@article{attackformer2024,
+@article{attackformer2026,
+  author={xujiahao}
   title={AttackFormer: Forbidden-Aware Adversarial Generation via Hybrid RL-Diffusion},
   year={2026}
 }

@@ -1,6 +1,6 @@
 """
 attackformer_train.py
-间接采样训练器：不查询LLM，完全基于Guard信号+同源假设优化
+迭代式Guard增强训练器（Scaling版）
 """
 
 import torch
@@ -23,7 +23,7 @@ rcParams['axes.unicode_minus'] = False
 
 from attackformer_model import (
     AttackFormer, AttackFormerConfig,
-    IndirectRewardFunction, XGuardMock, RolloutBuffer
+    IterativeRewardFunction, XGuardMock, RolloutBuffer
 )
 
 from attackformer_dataset import (
@@ -32,8 +32,6 @@ from attackformer_dataset import (
     paraphrase_collate_fn, jailbreak_collate_fn
 )
 
-
-# ==================== 语义编码器（用于评估语义保持） ====================
 
 class SemanticEncoder:
     _instance = None
@@ -70,8 +68,7 @@ def setup_figure_dir(base_dir='./figures'):
 def plot_stage1_curves(history, save_path):
     epochs = history['stage1']['epochs']
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('Stage 1: Offline Semantic-Preserving Pre-training', fontsize=14, fontweight='bold')
-    
+    fig.suptitle('Stage 1: Offline Pre-training', fontsize=14, fontweight='bold')
     metrics = [
         (history['stage1']['loss'], 'Total Loss', 'b-o'),
         (history['stage1']['semantic'], 'Semantic Loss', 'g-s'),
@@ -85,14 +82,16 @@ def plot_stage1_curves(history, save_path):
 
 def plot_stage2_curves(history, save_path):
     episodes = history['stage2']['episodes']
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    fig.suptitle('Stage 2: Indirect Sampling PPO (Guard-Driven)', fontsize=14, fontweight='bold')
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle('Stage 2: Iterative Guard Amplification (Scaling)', fontsize=14, fontweight='bold')
     
     metrics = [
         (history['stage2']['reward'], 'Avg Reward', 'b-o'),
         (history['stage2']['guard_pass'], 'Guard Pass Rate', 'g-s'),
         (history['stage2']['guard_uncertainty'], 'Guard Uncertainty', 'm-d'),
-        (history['stage2']['semantic'], 'Semantic Similarity', 'c-v')
+        (history['stage2']['iterative_improve'], 'Iterative Improve', 'y-*'),
+        (history['stage2']['semantic'], 'Semantic Similarity', 'c-v'),
+        (history['stage2']['avg_iterations'], 'Avg Iterations', 'k-x')
     ]
     for ax, (data, title, style) in zip(axes.flat, metrics):
         ax.plot(episodes, data, style, linewidth=2, markersize=4)
@@ -100,16 +99,44 @@ def plot_stage2_curves(history, save_path):
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.savefig(save_path, dpi=300, bbox_inches='tight'); plt.close()
 
+def plot_iteration_analysis(history, save_path):
+    """绘制迭代改进分析"""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # 各轮次的Guard置信度分布
+    ax1 = axes[0]
+    for i in range(3):
+        key = f'iter_{i}_conf'
+        if key in history.get('iteration_stats', {}):
+            data = history['iteration_stats'][key]
+            ax1.plot(data['episodes'], data['values'], '-o', label=f'Iteration {i}')
+    ax1.set_title('Guard Confidence by Iteration', fontweight='bold')
+    ax1.set_xlabel('Episode'); ax1.set_ylabel('Confidence')
+    ax1.legend(); ax1.grid(True, alpha=0.3)
+    
+    # 迭代轮数分布
+    ax2 = axes[1]
+    if 'iteration_counts' in history:
+        episodes = history['iteration_counts']['episodes']
+        counts = history['iteration_counts']['counts']
+        ax2.bar(range(len(counts[0])), [np.mean([c[i] for c in counts]) for i in range(len(counts[0]))])
+        ax2.set_title('Average Iteration Count Distribution', fontweight='bold')
+        ax2.set_xlabel('Iteration'); ax2.set_ylabel('Frequency')
+    
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight'); plt.close()
+
 def plot_evaluation_results(results, save_path):
-    metrics = ['Guard Pass\n(表面安全)', 'Guard Uncertainty\n(盲区推断)', 'Semantic\nPreserve', 'Forbidden\nDistance', 'Avg Reward']
+    metrics = ['Guard Pass', 'Uncertainty', 'Iter. Improve', 'Semantic', 'F-Dist', 'Reward']
     values = [
         results.get('guard_pass_rate', 0),
         results.get('guard_uncertainty', 0),
+        results.get('iterative_improve', 0),
         results.get('semantic_rate', 0),
         results.get('forbidden_dist', 0),
         results.get('avg_reward', 0)
     ]
-    colors = ['#2ecc71', '#f39c12', '#3498db', '#e74c3c', '#9b59b6']
+    colors = ['#2ecc71', '#f39c12', '#e67e22', '#3498db', '#e74c3c', '#9b59b6']
     
     fig = plt.figure(figsize=(16, 6))
     gs = fig.add_gridspec(1, 2, width_ratios=[2, 1])
@@ -118,7 +145,7 @@ def plot_evaluation_results(results, save_path):
     bars = ax1.bar(metrics, values, color=colors, edgecolor='black', linewidth=1.2, alpha=0.85)
     ax1.set_ylim(0, max(1.0, max(values) * 1.2))
     ax1.set_ylabel('Value')
-    ax1.set_title('Indirect Sampling Evaluation (Guard-Driven)', fontsize=14, fontweight='bold')
+    ax1.set_title('Iterative Guard Amplification Evaluation', fontsize=14, fontweight='bold')
     ax1.grid(axis='y', alpha=0.3)
     
     for bar, val in zip(bars, values):
@@ -132,7 +159,8 @@ def plot_evaluation_results(results, save_path):
     table_data = [
         ['Metric', 'Value'],
         ['Guard Pass Rate', f"{results.get('guard_pass_rate', 0):.2%}"],
-        ['Guard Uncertainty', f"{results.get('guard_uncertainty', 0):.2%}"],
+        ['Guard Uncertainty', f"{results.get('guard_uncertainty', 0):.3f}"],
+        ['Iterative Improve', f"{results.get('iterative_improve', 0):.4f}"],
         ['Semantic Preserve', f"{results.get('semantic_rate', 0):.2%}"],
         ['Forbidden Distance', f"{results.get('forbidden_dist', 0):.4f}"],
         ['Avg Reward', f"{results.get('avg_reward', 0):.4f}"]
@@ -146,58 +174,8 @@ def plot_evaluation_results(results, save_path):
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight'); plt.close()
 
-def plot_comprehensive_dashboard(history, eval_results, save_path):
-    fig = plt.figure(figsize=(20, 12))
-    gs = fig.add_gridspec(2, 3, hspace=0.3, wspace=0.3)
-    
-    # Stage 1
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.plot(history['stage1']['epochs'], history['stage1']['loss'], 'b-o', linewidth=2)
-    ax1.set_title('S1: Loss', fontweight='bold'); ax1.grid(True, alpha=0.3)
-    
-    ax2 = fig.add_subplot(gs[0, 1])
-    ax2.plot(history['stage1']['epochs'], history['stage1']['semantic'], 'g-s', linewidth=2)
-    ax2.set_title('S1: Semantic', fontweight='bold'); ax2.grid(True, alpha=0.3)
-    
-    ax3 = fig.add_subplot(gs[0, 2])
-    ax3.plot(history['stage1']['epochs'], history['stage1']['penalty'], 'r-^', linewidth=2)
-    ax3.set_title('S1: Penalty', fontweight='bold'); ax3.grid(True, alpha=0.3)
-    
-    # Stage 2
-    ax4 = fig.add_subplot(gs[1, 0])
-    ax4.plot(history['stage2']['episodes'], history['stage2']['reward'], 'b-o', linewidth=2)
-    ax4.set_title('S2: Reward', fontweight='bold'); ax4.grid(True, alpha=0.3)
-    
-    ax5 = fig.add_subplot(gs[1, 1])
-    ax5.plot(history['stage2']['episodes'], history['stage2']['guard_pass'], 'g-s', linewidth=2, label='Pass')
-    ax5.plot(history['stage2']['episodes'], history['stage2']['guard_uncertainty'], 'm-d', linewidth=2, label='Uncertainty')
-    ax5.set_title('S2: Guard Signals', fontweight='bold'); ax5.legend(); ax5.grid(True, alpha=0.3)
-    
-    # Eval
-    ax6 = fig.add_subplot(gs[1, 2])
-    metrics = ['Pass', 'Uncert.', 'Sem.', 'F-Dist', 'Reward']
-    values = [
-        eval_results.get('guard_pass_rate', 0),
-        eval_results.get('guard_uncertainty', 0),
-        eval_results.get('semantic_rate', 0),
-        eval_results.get('forbidden_dist', 0),
-        eval_results.get('avg_reward', 0)
-    ]
-    colors = ['#2ecc71', '#f39c12', '#3498db', '#e74c3c', '#9b59b6']
-    bars = ax6.bar(metrics, values, color=colors, alpha=0.85, edgecolor='black')
-    ax6.set_title('Final Eval', fontweight='bold')
-    ax6.set_ylim(0, max(1.0, max(values) * 1.2))
-    for bar, val in zip(bars, values):
-        height = bar.get_height()
-        label = f'{val:.2%}' if val <= 1.0 else f'{val:.2f}'
-        ax6.text(bar.get_x() + bar.get_width()/2., height, label,
-                ha='center', va='bottom', fontsize=10, fontweight='bold')
-    
-    fig.suptitle('AttackFormer: Guard-Driven Indirect Sampling Dashboard', fontsize=16, fontweight='bold', y=0.98)
-    plt.savefig(save_path, dpi=300, bbox_inches='tight'); plt.close()
 
-
-# ==================== 训练器（间接采样版） ====================
+# ==================== 训练器（Scaling版） ====================
 
 class AttackFormerTrainer:
     def __init__(self, model, config, device='cuda', save_dir='./checkpoints'):
@@ -207,7 +185,6 @@ class AttackFormerTrainer:
         self.save_dir = save_dir
         os.makedirs(save_dir, exist_ok=True)
         
-        # XGuard：同源高拟合分布的"探针"
         self.xguard = XGuardMock(config.embed_dim).to(device)
         self.buffer = RolloutBuffer()
         
@@ -224,23 +201,22 @@ class AttackFormerTrainer:
         self.history = {
             'stage1': {'epochs': [], 'loss': [], 'semantic': [], 'penalty': []},
             'stage2': {'episodes': [], 'reward': [], 'guard_pass': [],
-                      'guard_uncertainty': [], 'semantic': [], 'forbidden_dist': []}
+                      'guard_uncertainty': [], 'iterative_improve': [],
+                      'semantic': [], 'avg_iterations': []},
+            'iteration_stats': {},  # 新增：迭代统计
+            'iteration_counts': {'episodes': [], 'counts': []}
         }
         self.fig_dir = setup_figure_dir('./figures')
         
     def stage1_offline_pretrain(self, dataloader, epochs=10, save_every=2):
-        """
-        Stage 1: 离线预训练
-        目标：学习语义保持的改写能力 + 远离禁忌词
-        """
         print(f"\n===== Stage 1: Offline Pre-training =====")
         self.model.train()
         best_loss = float('inf')
         
         for epoch in range(epochs):
             total_loss = 0
-            total_semantic = 0
-            total_penalty = 0
+            total_sem = 0
+            total_pen = 0
             
             pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
             for batch in pbar:
@@ -249,32 +225,25 @@ class AttackFormerTrainer:
                 forbidden_ids = batch['forbidden_ids'].to(self.device)
                 B = original_ids.shape[0]
                 
-                # 时间步
                 t = torch.randint(0, self.config.diffusion_steps + 1, (B,), device=self.device)
-                # Stage 1：Guard信号为零（不引入Guard驱动）
                 guard_signal = torch.zeros(B, self.config.embed_dim, device=self.device)
                 
-                outputs = self.model(
-                    noisy_ids, forbidden_ids, guard_signal,
-                    time_step=t, original_ids=original_ids
-                )
+                outputs = self.model(noisy_ids, forbidden_ids, guard_signal,
+                                   time_step=t, original_ids=original_ids)
                 logits = outputs['logits']
                 
-                # 重建损失
                 loss = F.cross_entropy(
                     logits.view(-1, self.config.vocab_size),
                     original_ids.view(-1),
                     ignore_index=self.config.pad_token_id
                 )
                 
-                # 语义保持
                 if 'semantic_loss' in outputs:
                     loss = loss + 0.1 * outputs['semantic_loss']
-                    total_semantic += outputs['semantic_loss'].item()
+                    total_sem += outputs['semantic_loss'].item()
                 
-                # Soft penalty
                 loss = loss + 0.05 * outputs['soft_penalty']
-                total_penalty += outputs['soft_penalty'].item()
+                total_pen += outputs['soft_penalty'].item()
                 
                 self.diffusion_optimizer.zero_grad()
                 loss.backward()
@@ -284,8 +253,8 @@ class AttackFormerTrainer:
                 total_loss += loss.item()
             
             avg_loss = total_loss / len(dataloader)
-            avg_sem = total_semantic / len(dataloader)
-            avg_pen = total_penalty / len(dataloader)
+            avg_sem = total_sem / len(dataloader)
+            avg_pen = total_pen / len(dataloader)
             
             self.history['stage1']['epochs'].append(epoch + 1)
             self.history['stage1']['loss'].append(avg_loss)
@@ -295,49 +264,45 @@ class AttackFormerTrainer:
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 self.save_checkpoint(f'{self.save_dir}/stage1_best.pt')
-            
             if (epoch + 1) % save_every == 0:
                 self.save_checkpoint(f'{self.save_dir}/stage1_epoch{epoch+1}.pt')
-            
             self.scheduler.step()
         
         plot_stage1_curves(self.history, save_path=f'{self.fig_dir}/stage1_curves.png')
         print(f"Stage 1 completed. Best loss: {best_loss:.4f}")
     
-    def stage2_online_ppo(
+    def stage2_iterative_ppo(
         self,
         prompt_dataloader: DataLoader,
         tokenizer,
         num_episodes: int = 1000,
         ppo_epochs: int = 4,
-        update_every: int = 32
+        update_every: int = 32,
+        max_iterations: int = 3
     ):
         """
-        Stage 2: 在线PPO微调（间接采样，不查询LLM）
+        Stage 2: 迭代式Guard增强PPO（Scaling核心）
         
-        核心流程：
-        1. 生成对抗Prompt（应用Hard Mask，不生成禁忌词）
-        2. 查询XGuard（探针）获取拒绝置信度
-        3. 基于同源假设计算奖励：
-           - Guard通过（表面人畜无害）
-           - Guard低置信度（处于盲区→LLM也处于盲区）
-           - 语义保持
-           - Forbidden距离
+        每轮训练：
+        1. 使用iterative_generate生成多轮改进的对抗Prompt
+        2. 记录每轮Guard信号和置信度
+        3. 奖励包含迭代改进项（当前轮比前一轮更好）
         4. PPO更新
         """
-        print(f"\n===== Stage 2: Indirect Sampling PPO (No LLM Query) =====")
-        print("Core Insight: Guard and LLM share high-fitting distribution.")
-        print("Guard's low-confidence pass zone ≈ LLM's defense blind zone.")
+        print(f"\n===== Stage 2: Iterative Guard Amplification =====")
+        print(f"Max iterations per episode: {max_iterations}")
+        print("Core: Each new prompt re-enters Guard for evaluation enhancement.")
         self.model.train()
         
-        reward_fn = IndirectRewardFunction(self.config)
+        reward_fn = IterativeRewardFunction(self.config)
         semantic_encoder = SemanticEncoder.get_instance(self.device)
         
         episode_rewards = []
         episode_guard_pass = []
-        episode_guard_uncertainty = []
+        episode_guard_unc = []
+        episode_iter_improve = []
         episode_semantic = []
-        episode_forbidden_dist = []
+        episode_avg_iters = []
         
         for episode in range(num_episodes):
             try:
@@ -355,33 +320,44 @@ class AttackFormerTrainer:
             forbidden_ids = batch['forbidden_ids'].to(self.device)
             B = original_ids.shape[0]
             
-            # 1. 生成对抗Prompt（Guard信号初始化为0，生成过程中逐步演化）
-            with torch.no_grad():
-                # 初始Guard信号（零向量，让模型学习自主演化）
-                guard_signal = torch.zeros(B, self.config.embed_dim, device=self.device)
-                generated_ids, log_probs, adv_texts = self.model.generate_adversarial(
-                    original_ids, forbidden_ids, guard_signal,
-                    max_length=self.config.max_seq_len,
-                    return_text=True,
-                    tokenizer=tokenizer
-                )
-            
-            # 2. 查询XGuard（探针）：评估对抗Prompt的安全性
-            # 注意：这里评估的是Prompt，不是LLM输出！
-            with torch.no_grad():
-                gen_emb = self.model.embed_tokens(generated_ids)
-                xguard_out = self.xguard.evaluate(generated_ids, gen_emb)
-                guard_conf = xguard_out['confidence']   # 拒绝置信度
-                guard_label = xguard_out['label']        # 0=通过, 1=拒绝
-                guard_notes = xguard_out['notes_emb']
-            
-            # 3. 计算语义保持（原始Prompt vs 对抗Prompt）
             original_texts = [tokenizer.decode(ids.tolist()) for ids in original_ids]
+            
+            # ===== Scaling核心：迭代式Guard增强生成 =====
+            all_iterations = self.model.iterative_generate(
+                original_ids, forbidden_ids, self.xguard,
+                max_length=self.config.max_seq_len,
+                max_iterations=max_iterations,
+                return_all_iterations=True,
+                tokenizer=tokenizer
+            )
+            
+            # 选择最佳一轮（Guard通过且置信度最低）
+            best_iter = min(range(len(all_iterations)),
+                          key=lambda i: all_iterations[i]['guard_conf'].mean() 
+                          + all_iterations[i]['guard_label'].mean() * 10)
+            
+            best_result = all_iterations[best_iter]
+            generated_ids = best_result['generated_ids']
+            log_probs = best_result['log_probs']
+            guard_conf = best_result['guard_conf']
+            guard_label = best_result['guard_label']
+            guard_notes = best_result['guard_notes']
+            actual_iterations = best_result['iteration'] + 1
+            
+            # 计算迭代改进（当前轮 vs 前一轮）
+            prev_guard_conf = None
+            if best_iter > 0:
+                prev_guard_conf = all_iterations[best_iter - 1]['guard_conf']
+            
+            # 语义保持
+            adv_texts = best_result.get('texts', 
+                [tokenizer.decode(ids[ids != self.config.pad_token_id].tolist()) 
+                 for ids in generated_ids])
             orig_emb = semantic_encoder.encode(original_texts, convert_to_tensor=True)
             adv_emb = semantic_encoder.encode(adv_texts, convert_to_tensor=True)
             semantic_sim = F.cosine_similarity(orig_emb, adv_emb, dim=-1).to(self.device)
             
-            # 4. 计算Forbidden距离（基于对抗Prompt的隐藏状态）
+            # Forbidden距离
             with torch.no_grad():
                 model_out = self.model(
                     generated_ids, forbidden_ids, guard_notes,
@@ -389,18 +365,17 @@ class AttackFormerTrainer:
                 )
                 forbidden_dist = model_out['forbidden_distance']
             
-            # 5. 间接奖励计算（核心：不查询LLM！）
-            # 同源假设：Guard的低置信度通过区 ≈ LLM的防御盲区
+            # 间接奖励（包含迭代改进项）
             guard_pass = (guard_label == 0).float()
-            
             rewards = reward_fn.compute(
                 guard_pass=guard_pass,
                 guard_confidence=guard_conf,
                 semantic_sim=semantic_sim,
-                forbidden_distance=forbidden_dist
+                forbidden_distance=forbidden_dist,
+                prev_guard_conf=prev_guard_conf
             )
             
-            # 6. 计算Value（用于GAE）
+            # Value
             with torch.no_grad():
                 value_out = self.model(
                     generated_ids, forbidden_ids, guard_notes,
@@ -408,7 +383,7 @@ class AttackFormerTrainer:
                 )
                 values = value_out['value']
             
-            # 7. 存储经验
+            # 存储经验（记录迭代信息）
             for i in range(B):
                 self.buffer.add(
                     state=(original_ids[i].cpu(), forbidden_ids[i].cpu()),
@@ -416,17 +391,27 @@ class AttackFormerTrainer:
                     log_prob=log_probs[i].mean().item(),
                     reward=rewards[i].item(),
                     value=values[i].item(),
-                    done=True
+                    done=True,
+                    guard_signal=guard_notes[i].cpu(),
+                    iteration=actual_iterations
                 )
             
             # 记录统计
             episode_rewards.append(rewards.mean().item())
             episode_guard_pass.append(guard_pass.mean().item())
-            episode_guard_uncertainty.append((1 - guard_conf).mean().item())
-            episode_semantic.append(semantic_sim.mean().item())
-            episode_forbidden_dist.append(forbidden_dist.mean().item())
+            episode_guard_unc.append((1 - guard_conf).mean().item())
             
-            # 8. PPO更新
+            # 迭代改进
+            if prev_guard_conf is not None:
+                improve = F.relu(prev_guard_conf - guard_conf).mean().item()
+            else:
+                improve = 0.0
+            episode_iter_improve.append(improve)
+            
+            episode_semantic.append(semantic_sim.mean().item())
+            episode_avg_iters.append(actual_iterations)
+            
+            # PPO更新
             if len(self.buffer.states) >= update_every:
                 self._ppo_update(ppo_epochs)
                 self.buffer.clear()
@@ -435,28 +420,47 @@ class AttackFormerTrainer:
             if episode % 100 == 0 and episode > 0:
                 avg_reward = np.mean(episode_rewards[-100:])
                 avg_pass = np.mean(episode_guard_pass[-100:])
-                avg_unc = np.mean(episode_guard_uncertainty[-100:])
+                avg_unc = np.mean(episode_guard_unc[-100:])
+                avg_improve = np.mean(episode_iter_improve[-100:])
                 avg_sem = np.mean(episode_semantic[-100:])
-                avg_fd = np.mean(episode_forbidden_dist[-100:])
+                avg_iters = np.mean(episode_avg_iters[-100:])
                 
                 print(f"\nEpisode {episode}:")
-                print(f"  Reward={avg_reward:.4f}, GuardPass={avg_pass:.2%}, "
-                      f"Uncertainty={avg_unc:.3f}, Semantic={avg_sem:.3f}, "
-                      f"F-Dist={avg_fd:.3f}")
-                print(f"  Original: {original_texts[0][:60]}...")
-                print(f"  Adversarial: {adv_texts[0][:60]}...")
+                print(f"  Reward={avg_reward:.4f}, Pass={avg_pass:.2%}, "
+                      f"Uncertainty={avg_unc:.3f}, Improve={avg_improve:.3f}")
+                print(f"  Semantic={avg_sem:.3f}, AvgIters={avg_iters:.1f}")
+                print(f"  Original: {original_texts[0][:50]}...")
+                print(f"  Adversarial: {adv_texts[0][:50]}...")
+                
+                # 记录迭代统计
+                for i, iter_result in enumerate(all_iterations):
+                    key = f'iter_{i}_conf'
+                    if key not in self.history['iteration_stats']:
+                        self.history['iteration_stats'][key] = {'episodes': [], 'values': []}
+                    self.history['iteration_stats'][key]['episodes'].append(episode)
+                    self.history['iteration_stats'][key]['values'].append(
+                        iter_result['guard_conf'].mean().item()
+                    )
+                
+                self.history['iteration_counts']['episodes'].append(episode)
+                self.history['iteration_counts']['counts'].append([
+                    sum(1 for r in all_iterations if r['iteration'] == j) 
+                    for j in range(max_iterations)
+                ])
                 
                 self.history['stage2']['episodes'].append(episode)
                 self.history['stage2']['reward'].append(avg_reward)
                 self.history['stage2']['guard_pass'].append(avg_pass)
                 self.history['stage2']['guard_uncertainty'].append(avg_unc)
+                self.history['stage2']['iterative_improve'].append(avg_improve)
                 self.history['stage2']['semantic'].append(avg_sem)
-                self.history['stage2']['forbidden_dist'].append(avg_fd)
+                self.history['stage2']['avg_iterations'].append(avg_iters)
                 
                 self.save_checkpoint(f'{self.save_dir}/stage2_ep{episode}.pt')
         
         if len(self.history['stage2']['episodes']) > 0:
             plot_stage2_curves(self.history, save_path=f'{self.fig_dir}/stage2_curves.png')
+            plot_iteration_analysis(self.history, save_path=f'{self.fig_dir}/iteration_analysis.png')
     
     def _ppo_update(self, ppo_epochs):
         states = self.buffer.states
@@ -464,6 +468,8 @@ class AttackFormerTrainer:
         old_log_probs = torch.tensor(self.buffer.log_probs, dtype=torch.float32, device=self.device)
         rewards = torch.tensor(self.buffer.rewards, dtype=torch.float32, device=self.device)
         values = torch.tensor(self.buffer.values, dtype=torch.float32, device=self.device)
+        guard_signals = self.buffer.guard_signals
+        iterations = self.buffer.iterations
         
         advantages = self._compute_gae(rewards, values)
         returns = advantages + values
@@ -474,12 +480,17 @@ class AttackFormerTrainer:
             new_values = []
             entropy_list = []
             
-            for state, action in zip(states, actions):
+            for state, action, gs, it in zip(states, actions, guard_signals, iterations):
                 orig_ids = state[0].unsqueeze(0).to(self.device)
                 forb_ids = state[1].unsqueeze(0).to(self.device)
-                guard_signal = torch.zeros(1, self.config.embed_dim, device=self.device)
+                gs = gs.unsqueeze(0).to(self.device) if gs is not None else \
+                     torch.zeros(1, self.config.embed_dim, device=self.device)
                 
-                outputs = self.model(orig_ids, forb_ids, guard_signal, return_value=True)
+                outputs = self.model(
+                    orig_ids, forb_ids, gs,
+                    return_value=True,
+                    iteration=min(it, self.config.max_guard_iterations - 1)
+                )
                 logits = outputs['logits']
                 value = outputs['value']
                 
@@ -542,83 +553,103 @@ class AttackFormerTrainer:
         print(f"Checkpoint loaded from {path}")
 
 
-# ==================== 评估函数（间接采样验证） ====================
+# ==================== 评估函数（Scaling版） ====================
 
-def evaluate_attack(
-    model: AttackFormer,
-    test_dataloader: DataLoader,
-    xguard: XGuardMock,
-    tokenizer,
-    device: str = 'cuda'
-) -> Dict[str, float]:
+def evaluate_attack(model, test_dataloader, xguard, tokenizer, device='cuda', max_iterations=3):
     """
-    间接采样评估：
-    - 不查询LLM
-    - 完全基于Guard信号评估攻击效果
-    - 验证：Guard通过 + 低置信度（盲区推断）
+    迭代式评估：展示每轮Guard置信度的变化
     """
     model.eval()
     semantic_encoder = SemanticEncoder.get_instance(device)
     
     total = 0
     guard_pass_total = 0
-    guard_uncertainty_total = 0
+    guard_unc_total = 0
+    iter_improve_total = 0
     semantic_total = 0
     forbidden_dist_total = 0
     total_reward = 0
     
-    reward_fn = IndirectRewardFunction(model.config)
+    # 迭代统计
+    iter_confidences = {i: [] for i in range(max_iterations)}
+    iter_counts = [0] * max_iterations
+    
+    reward_fn = IterativeRewardFunction(model.config)
     
     with torch.no_grad():
-        for batch in tqdm(test_dataloader, desc="Evaluating (Indirect)"):
+        for batch in tqdm(test_dataloader, desc="Evaluating (Iterative)"):
             original_ids = batch['original_ids'].to(device)
             forbidden_ids = batch['forbidden_ids'].to(device)
             B = original_ids.shape[0]
             
-            # 生成对抗Prompt
-            guard_signal = torch.zeros(B, model.config.embed_dim, device=device)
-            generated_ids, _, adv_texts = model.generate_adversarial(
-                original_ids, forbidden_ids, guard_signal,
+            original_texts = [tokenizer.decode(ids.tolist()) for ids in original_ids]
+            
+            # 迭代生成
+            all_iterations = model.iterative_generate(
+                original_ids, forbidden_ids, xguard,
                 max_length=model.config.max_seq_len,
-                return_text=True, tokenizer=tokenizer
+                max_iterations=max_iterations,
+                return_all_iterations=True,
+                tokenizer=tokenizer
             )
             
-            # 查询Guard（探针）
-            gen_emb = model.embed_tokens(generated_ids)
-            xguard_out = xguard.evaluate(generated_ids, gen_emb)
-            guard_conf = xguard_out['confidence']
-            guard_label = xguard_out['label']
-            guard_notes = xguard_out['notes_emb']
+            # 选择最佳
+            best_idx = min(range(len(all_iterations)),
+                          key=lambda i: all_iterations[i]['guard_conf'].mean()
+                          + all_iterations[i]['guard_label'].mean() * 10)
+            best = all_iterations[best_idx]
             
-            # 语义保持
-            original_texts = [tokenizer.decode(ids.tolist()) for ids in original_ids]
+            # 记录每轮置信度
+            for i, iter_result in enumerate(all_iterations):
+                iter_confidences[i].append(iter_result['guard_conf'].mean().item())
+                iter_counts[min(i, max_iterations-1)] += 1
+            
+            # 计算改进
+            prev_conf = all_iterations[best_idx - 1]['guard_conf'] if best_idx > 0 else None
+            
+            # 语义
+            adv_texts = best.get('texts', [])
             orig_emb = semantic_encoder.encode(original_texts, convert_to_tensor=True)
             adv_emb = semantic_encoder.encode(adv_texts, convert_to_tensor=True)
             semantic_sim = F.cosine_similarity(orig_emb, adv_emb, dim=-1).to(device)
             
             # Forbidden距离
-            model_out = model(generated_ids, forbidden_ids, guard_notes, original_ids=original_ids)
+            model_out = model(
+                best['generated_ids'], forbidden_ids, best['guard_notes'],
+                original_ids=original_ids
+            )
             forbidden_dist = model_out['forbidden_distance']
             
             # 奖励
-            guard_pass = (guard_label == 0).float()
+            guard_pass = (best['guard_label'] == 0).float()
             rewards = reward_fn.compute(
                 guard_pass=guard_pass,
-                guard_confidence=guard_conf,
+                guard_confidence=best['guard_conf'],
                 semantic_sim=semantic_sim,
-                forbidden_distance=forbidden_dist
+                forbidden_distance=forbidden_dist,
+                prev_guard_conf=prev_conf
             )
             
             total += B
             guard_pass_total += guard_pass.sum().item()
-            guard_uncertainty_total += (1 - guard_conf).sum().item()
+            guard_unc_total += (1 - best['guard_conf']).sum().item()
+            if prev_conf is not None:
+                iter_improve_total += F.relu(prev_conf - best['guard_conf']).sum().item()
             semantic_total += (semantic_sim > 0.7).sum().item()
             forbidden_dist_total += forbidden_dist.sum().item()
             total_reward += rewards.sum().item()
     
+    # 打印迭代分析
+    print("\nIteration Confidence Analysis:")
+    for i in range(max_iterations):
+        if iter_confidences[i]:
+            avg_conf = np.mean(iter_confidences[i])
+            print(f"  Iteration {i}: Avg Guard Conf = {avg_conf:.4f}")
+    
     return {
         'guard_pass_rate': guard_pass_total / total,
-        'guard_uncertainty': guard_uncertainty_total / total,
+        'guard_uncertainty': guard_unc_total / total,
+        'iterative_improve': iter_improve_total / total,
         'semantic_rate': semantic_total / total,
         'forbidden_dist': forbidden_dist_total / total,
         'avg_reward': total_reward / total
@@ -637,6 +668,8 @@ def main():
         forbidden_vocab_size=1000,
         diffusion_steps=10,
         mask_token_id=49999,
+        max_guard_iterations=3,      # Scaling：最大迭代轮数
+        guard_signal_accum=True,      # 累积Guard信号
         stage="offline"
     )
     
@@ -648,7 +681,7 @@ def main():
     
     trainer = AttackFormerTrainer(model, config, device=device, save_dir='./checkpoints')
     
-    # Stage 1: 离线预训练（学习语义保持 + 远离禁忌词）
+    # Stage 1
     para_dataset = ParaphraseDataset(
         data_path='data/paraphrase_train.jsonl',
         tokenizer=tokenizer,
@@ -661,7 +694,7 @@ def main():
     )
     trainer.stage1_offline_pretrain(dataloader=para_dataloader, epochs=10, save_every=2)
     
-    # Stage 2: 间接采样PPO（不查询LLM！）
+    # Stage 2: 迭代式Guard增强
     jb_dataset = JailbreakDataset(
         data_path='data/advbench_harmful_behaviors.csv',
         tokenizer=tokenizer,
@@ -674,16 +707,16 @@ def main():
     
     trainer.load_checkpoint('./checkpoints/stage1_best.pt')
     
-    # 关键：Stage 2完全不查询LLM，仅通过Guard间接采样
-    trainer.stage2_online_ppo(
+    trainer.stage2_iterative_ppo(
         prompt_dataloader=jb_dataloader,
         tokenizer=tokenizer,
         num_episodes=1000,
         ppo_epochs=4,
-        update_every=32
+        update_every=32,
+        max_iterations=config.max_guard_iterations
     )
     
-    # 评估（同样不查询LLM）
+    # 评估
     test_dataset = JailbreakDataset(
         data_path='data/advbench_test.csv',
         tokenizer=tokenizer,
@@ -693,22 +726,21 @@ def main():
         test_dataset, batch_size=16, collate_fn=jailbreak_collate_fn
     )
     
-    results = evaluate_attack(model, test_dataloader, trainer.xguard, tokenizer, device)
+    results = evaluate_attack(
+        model, test_dataloader, trainer.xguard, tokenizer, device,
+        max_iterations=config.max_guard_iterations
+    )
     
-    print("\nFinal Results (Indirect Sampling):")
+    print("\nFinal Results (Iterative Guard Amplification):")
     print(f"  Guard Pass Rate: {results['guard_pass_rate']:.2%}")
     print(f"  Guard Uncertainty: {results['guard_uncertainty']:.3f}")
+    print(f"  Iterative Improve: {results['iterative_improve']:.4f}")
     print(f"  Semantic Preserve: {results['semantic_rate']:.2%}")
     print(f"  Forbidden Distance: {results['forbidden_dist']:.4f}")
     print(f"  Average Reward: {results['avg_reward']:.4f}")
     
     plot_evaluation_results(results, save_path=f'{trainer.fig_dir}/eval_results.png')
-    plot_comprehensive_dashboard(
-        trainer.history, results,
-        save_path=f'{trainer.fig_dir}/comprehensive_dashboard.png'
-    )
     
-    trainer.save_checkpoint('./checkpoints/attackformer_final.pt')
     print("\nTraining completed! All figures saved to ./figures/")
     
     fig_files = glob.glob(f'{trainer.fig_dir}/*.png')

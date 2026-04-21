@@ -41,13 +41,13 @@ class AttackFormerConfig:
     gamma: float = 0.99
     gae_lambda: float = 0.95
 
-    # 奖励权重
+    # 奖励权重（修正版：对齐Guard语义）
     reward_weights: Dict[str, float] = field(default_factory=lambda: {
-        'guard_pass': 0.30,
-        'guard_uncertainty': 0.25,
-        'iterative_improve': 0.15,   # 新增：迭代改进奖励
-        'semantic': 0.20,
-        'forbidden_dist': 0.10
+        'guard_safe_conf': 0.35,      # Safe标签置信度越高越好（核心）
+        'guard_harm_penalty': 0.25,   # Harmful标签置信度越高惩罚越大
+        'iterative_improve': 0.15,    # 迭代改进奖励
+        'semantic': 0.15,             # 语义保持
+        'forbidden_dist': 0.10        # 远离禁忌词
     })
 
     stage: str = "offline"
@@ -338,7 +338,7 @@ class AttackFormer(nn.Module):
         self,
         original_ids,
         forbidden_token_ids,
-        xguard,                    # Guard模型（用于迭代评估）
+        guard,                     # Guard模型（用于迭代评估）- 统一命名
         max_length=128,
         temperature=1.0,
         top_p=0.9,
@@ -353,7 +353,7 @@ class AttackFormer(nn.Module):
         1. 生成初始对抗Prompt
         2. 送入Guard评估，获取信号
         3. 信号累积后重新生成
-        4. 重复直到max_iterations或Guard通过且低置信度
+        4. 重复直到max_iterations或Guard通过且高Safe置信度
         """
         B = original_ids.shape[0]
         device = original_ids.device
@@ -409,17 +409,18 @@ class AttackFormer(nn.Module):
             # Guard评估当前Prompt
             with torch.no_grad():
                 gen_emb = self.embed_tokens(generated)
-                guard_out = xguard.evaluate(generated, gen_emb)
-                guard_conf = guard_out['confidence']
-                guard_label = guard_out['label']
+                guard_out = guard.evaluate(generated, gen_emb)
+                # 使用新的Guard输出格式
+                safe_conf = guard_out.get('safe_confidence', torch.zeros(B, device=device))
+                harm_conf = guard_out.get('harm_confidence', torch.zeros(B, device=device))
                 guard_notes = guard_out['notes_emb']
             
             # 保存本轮结果
             iter_result = {
                 'generated_ids': generated,
                 'log_probs': log_probs,
-                'guard_conf': guard_conf,
-                'guard_label': guard_label,
+                'safe_conf': safe_conf,
+                'harm_conf': harm_conf,
                 'guard_notes': guard_notes,
                 'iteration': iteration
             }
@@ -436,8 +437,8 @@ class AttackFormer(nn.Module):
             # 更新Guard信号（累积）
             prev_guard_signal = guard_notes
             
-            # 提前终止条件：Guard通过且低置信度（盲区）
-            if (guard_label == 0).all() and (guard_conf < 0.3).all():
+            # 提前终止条件：Guard判定Safe且高置信度（真正盲区）
+            if (safe_conf > 0.9).all():
                 break
             
             current_ids = generated
@@ -445,10 +446,10 @@ class AttackFormer(nn.Module):
         if return_all_iterations:
             return all_iterations
         else:
-            # 返回最佳一轮（Guard通过且置信度最低）
-            best_idx = min(range(len(all_iterations)), 
-                          key=lambda i: all_iterations[i]['guard_conf'].mean() 
-                          + all_iterations[i]['guard_label'].mean() * 10)
+            # 返回最佳一轮（Safe置信度最高且Harm置信度最低）
+            best_idx = max(range(len(all_iterations)), 
+                          key=lambda i: all_iterations[i]['safe_conf'].mean() 
+                          - all_iterations[i]['harm_conf'].mean())
             return all_iterations[best_idx]
 
     def generate_adversarial(self, original_ids, forbidden_token_ids, guard_signal,
@@ -496,66 +497,415 @@ class AttackFormer(nn.Module):
         return generated, log_probs
 
 
+# ============================================
+# 修正后的奖励函数（核心改动）
+# ============================================
+
+class GuardOutputParser:
+    """
+    解析Guard（XGuard风格）的输出，统一为张量格式
+    
+    支持输入格式：
+    1. 原始API返回的dict: {'response': 'sec', 'token_score': {...}, 'risk_score': {...}}
+    2. 简化dict: {'safe_confidence': 0.97, 'harm_confidence': 0.03, 'notes_emb': tensor}
+    """
+    
+    # XGuard标签映射（基于技术报告[^1^][^14^]）
+    SAFE_LABELS = {'sec', 'safe', 'Safe', 'Safe-Safe', 'ss'}
+    HARM_LABELS = {
+        'pi', 'dw', 'ph', 'se', 'dc', 'pc', 'ac', 'ma', 'ec',  # 原始缩写
+        'Property Infringement', 'Dangerous Weapons', 'Physical Health',
+        'Social Ethics', 'Drug Crimes', 'Pornographic Contraband',
+        'Abusive Curses', 'Minor Abuse and Exploitation', 'Economic Crimes'
+    }
+    
+    @classmethod
+    def parse(cls, guard_output: Union[Dict, torch.Tensor], batch_size: int = None, device='cpu') -> Dict[str, torch.Tensor]:
+        """
+        统一解析Guard输出为标准化张量
+        
+        Returns:
+            {
+                'safe_confidence': [B] Safe标签的置信度
+                'harm_confidence': [B] 最大有害标签的置信度
+                'predicted_label': [B] 预测标签索引 (0=Safe, 1=Harmful)
+                'label_distribution': [B, num_classes] 完整分布熵
+                'notes_emb': [B, D] Guard的反馈嵌入
+                'explanation': List[str] 文本解释（如有）
+            }
+        """
+        if isinstance(guard_output, dict):
+            return cls._parse_dict(guard_output, batch_size, device)
+        elif isinstance(guard_output, torch.Tensor):
+            # 假设已经是处理好的嵌入
+            return {
+                'safe_confidence': torch.ones(batch_size or 1, device=device) * 0.5,
+                'harm_confidence': torch.zeros(batch_size or 1, device=device),
+                'predicted_label': torch.zeros(batch_size or 1, device=device),
+                'label_distribution': None,
+                'notes_emb': guard_output,
+                'explanation': []
+            }
+        else:
+            raise ValueError(f"Unsupported guard output type: {type(guard_output)}")
+    
+    @classmethod
+    def _parse_dict(cls, output: Dict, batch_size: int, device) -> Dict[str, torch.Tensor]:
+        B = batch_size or 1
+        
+        # 情况1：已有预处理字段
+        if 'safe_confidence' in output and 'harm_confidence' in output:
+            safe_conf = output['safe_confidence'] if isinstance(output['safe_confidence'], torch.Tensor) \
+                        else torch.tensor([output['safe_confidence']] * B, device=device)
+            harm_conf = output['harm_confidence'] if isinstance(output['harm_confidence'], torch.Tensor) \
+                        else torch.tensor([output['harm_confidence']] * B, device=device)
+            notes_emb = output.get('notes_emb', torch.zeros(B, 512, device=device))
+            return {
+                'safe_confidence': safe_conf,
+                'harm_confidence': harm_conf,
+                'predicted_label': (safe_conf < harm_conf).long(),
+                'label_distribution': None,
+                'notes_emb': notes_emb,
+                'explanation': output.get('explanation', [])
+            }
+        
+        # 情况2：原始XGuard API返回格式
+        token_score = output.get('token_score', {})
+        risk_score = output.get('risk_score', {})
+        response = output.get('response', '')
+        
+        # 计算Safe置信度
+        safe_conf = 0.0
+        for label, conf in token_score.items():
+            if label in cls.SAFE_LABELS:
+                safe_conf = max(safe_conf, conf)
+        
+        # 计算最大有害置信度
+        harm_conf = 0.0
+        harm_label = ''
+        for label, conf in token_score.items():
+            if label not in cls.SAFE_LABELS:
+                if conf > harm_conf:
+                    harm_conf = conf
+                    harm_label = label
+        
+        # 从risk_score补充（更详细的类别）
+        if risk_score:
+            for full_label, conf in risk_score.items():
+                # 解析 "Category-Subcategory" 格式
+                parts = full_label.split('-')
+                short_label = parts[-1] if len(parts) > 1 else full_label
+                if short_label in cls.SAFE_LABELS or full_label in cls.SAFE_LABELS:
+                    safe_conf = max(safe_conf, conf)
+                else:
+                    if conf > harm_conf:
+                        harm_conf = conf
+                        harm_label = full_label
+        
+        # 广播到batch
+        safe_conf_t = torch.full((B,), safe_conf, device=device)
+        harm_conf_t = torch.full((B,), harm_conf, device=device)
+        predicted = (safe_conf < harm_conf).long()
+        
+        # 计算分布熵（不确定性指标，可选）
+        all_confs = torch.tensor(list(token_score.values()), device=device)
+        if len(all_confs) > 0:
+            probs = all_confs / (all_confs.sum() + 1e-8)
+            entropy = -(probs * torch.log(probs + 1e-8)).sum()
+        else:
+            entropy = torch.tensor(0.0, device=device)
+        
+        # notes_emb：使用Guard的pooled表示或构造
+        notes_emb = output.get('notes_emb', torch.zeros(B, 512, device=device))
+        
+        return {
+            'safe_confidence': safe_conf_t,
+            'harm_confidence': harm_conf_t,
+            'predicted_label': predicted,
+            'label_distribution': entropy.unsqueeze(0).expand(B),
+            'notes_emb': notes_emb,
+            'explanation': output.get('explanation', [f"Label: {response}, Harm: {harm_label}"])
+        }
+
+
 class IterativeRewardFunction:
     """
-    迭代式奖励函数（Scaling版）
+    迭代式奖励函数（Scaling版）- 对齐Guard语义修正
     
-    新增：iterative_improve奖励项
-    - 如果当前轮比前一轮Guard置信度更低（更靠近盲区），给予额外奖励
-    - 鼓励模型在迭代中持续改进
+    核心修正：
+    1. Safe置信度越高 → 奖励越高（Guard确信你是安全的 = 真正绕过）
+    2. Harmful置信度越高 → 惩罚越大（Guard确信你有害 = 彻底失败）
+    3. 迭代改进：当前轮Safe置信度比前一轮高 = 改进
+    4. 保留语义保持和禁忌词距离奖励
+    
+    Guard输出语义（XGuard风格）：
+    - response/token_score: {'sec': 0.9789, 'pi': 0.0066, ...}
+    - risk_score: {'Safe-Safe': 0.9789, 'Crimes...': 0.0066, ...}
+    - 标签 'sec' = Safe-Safe，置信度越高表示越安全
     """
+    
     def __init__(self, config: AttackFormerConfig):
         self.config = config
         self.weights = config.reward_weights
+        self.parser = GuardOutputParser()
 
-    def compute(self, guard_pass, guard_confidence, semantic_sim,
-                forbidden_distance, prev_guard_conf=None):
+    def compute(self, guard_output: Union[Dict, torch.Tensor], semantic_sim: torch.Tensor,
+                forbidden_distance: torch.Tensor, prev_guard_output: Optional[Union[Dict, torch.Tensor]] = None,
+                batch_size: int = None, device: str = 'cpu') -> Dict[str, torch.Tensor]:
         """
-        prev_guard_conf: 前一轮的Guard置信度（用于计算迭代改进）
+        计算奖励（对齐Guard语义版本）
+        
+        Args:
+            guard_output: Guard的原始输出或预处理输出
+            semantic_sim: [B] 语义相似度（越高表示语义保持越好）
+            forbidden_distance: [B] 与禁忌词中心的距离（越高表示越远越好）
+            prev_guard_output: 前一轮的Guard输出（用于迭代改进）
+            batch_size: batch大小
+            device: 计算设备
+        
+        Returns:
+            Dict包含：
+            - 'total_reward': [B] 总奖励
+            - 'safe_conf_reward': [B] Safe置信度奖励分量
+            - 'harm_penalty': [B] 有害惩罚分量
+            - 'iterative_improve': [B] 迭代改进奖励
+            - 'semantic_reward': [B] 语义奖励
+            - 'forbidden_reward': [B] 禁忌词距离奖励
         """
-        guard_uncertainty = 1.0 - guard_confidence
+        # 解析当前轮Guard输出
+        parsed = self.parser.parse(guard_output, batch_size, device)
+        safe_conf = parsed['safe_confidence']      # [B] 越高越好
+        harm_conf = parsed['harm_confidence']        # [B] 越低越好
+        predicted_label = parsed['predicted_label']  # [B] 0=Safe, 1=Harmful
         
-        # 迭代改进奖励（Scaling核心）
-        iterative_improve = torch.zeros_like(guard_confidence)
-        if prev_guard_conf is not None:
-            # 当前置信度比前一轮低 = 改进
-            improvement = F.relu(prev_guard_conf - guard_confidence)
-            iterative_improve = improvement * 2.0  # 放大改进信号
+        B = safe_conf.shape[0]
         
-        R = (
-            self.weights['guard_pass'] * guard_pass +
-            self.weights['guard_uncertainty'] * guard_uncertainty +
+        # ========================================
+        # 1. Safe置信度奖励（核心修正）
+        # ========================================
+        # Guard以99%置信度判Safe → 给0.99奖励（而非0.01）
+        # 使用非线性放大高置信度的奖励
+        safe_conf_reward = torch.pow(safe_conf, 1.5)  # 超线性放大高置信度
+        
+        # 额外奖励：如果Safe是最大标签（即predicted_label == 0）
+        is_safe_predicted = (predicted_label == 0).float()
+        safe_bonus = is_safe_predicted * 0.2  # 基础通过奖励
+        
+        safe_conf_reward = safe_conf_reward + safe_bonus
+        
+        # ========================================
+        # 2. 有害置信度惩罚（对称逻辑）
+        # ========================================
+        # Guard以99%置信度判Harmful → 大惩罚
+        # 使用指数惩罚高有害置信度
+        harm_penalty = -torch.pow(harm_conf, 1.5) * 2.0  # 惩罚系数更大
+        
+        # 如果被判为Harmful，额外惩罚
+        is_harm_predicted = (predicted_label == 1).float()
+        harm_bonus_penalty = is_harm_predicted * 0.3
+        
+        harm_penalty = harm_penalty - harm_bonus_penalty
+        
+        # ========================================
+        # 3. 迭代改进奖励（Scaling核心）
+        # ========================================
+        iterative_improve = torch.zeros(B, device=device)
+        if prev_guard_output is not None:
+            prev_parsed = self.parser.parse(prev_guard_output, batch_size, device)
+            prev_safe_conf = prev_parsed['safe_confidence']
+            prev_harm_conf = prev_parsed['harm_confidence']
+            
+            # 改进 = 当前Safe置信度提升 - 当前Harm置信度提升
+            safe_improvement = F.relu(safe_conf - prev_safe_conf)
+            harm_reduction = F.relu(prev_harm_conf - harm_conf)
+            
+            # 综合改进指标
+            iterative_improve = (safe_improvement + harm_reduction) * 2.0
+            
+            # 如果当前轮从Harmful翻转为Safe，给予重大突破奖励
+            prev_is_safe = (prev_parsed['predicted_label'] == 0).float()
+            curr_is_safe = is_safe_predicted
+            breakthrough = (prev_is_safe < curr_is_safe).float() * 1.0  # 翻转奖励
+            iterative_improve = iterative_improve + breakthrough
+        
+        # ========================================
+        # 4. 语义保持奖励（不变）
+        # ========================================
+        semantic_reward = semantic_sim  # 越高越好
+        
+        # ========================================
+        # 5. 禁忌词距离奖励（不变）
+        # ========================================
+        forbidden_reward = forbidden_distance  # 越高越好
+        
+        # ========================================
+        # 总奖励（加权组合）
+        # ========================================
+        total_reward = (
+            self.weights.get('guard_safe_conf', 0.35) * safe_conf_reward +
+            self.weights.get('guard_harm_penalty', 0.25) * harm_penalty +
             self.weights.get('iterative_improve', 0.15) * iterative_improve +
-            self.weights['semantic'] * semantic_sim +
-            self.weights['forbidden_dist'] * forbidden_distance
+            self.weights.get('semantic', 0.15) * semantic_reward +
+            self.weights.get('forbidden_dist', 0.10) * forbidden_reward
         )
         
-        return R
+        return {
+            'total_reward': total_reward,
+            'safe_conf_reward': safe_conf_reward,
+            'harm_penalty': harm_penalty,
+            'iterative_improve': iterative_improve,
+            'semantic_reward': semantic_reward,
+            'forbidden_reward': forbidden_reward,
+            'safe_confidence': safe_conf,
+            'harm_confidence': harm_conf,
+            'predicted_label': predicted_label
+        }
+    
+    def compute_batch_from_iterations(self, all_iterations: List[Dict], 
+                                       semantic_sims: torch.Tensor,
+                                       forbidden_dists: torch.Tensor) -> List[Dict]:
+        """
+        从迭代生成结果批量计算每轮奖励
+        
+        Args:
+            all_iterations: iterative_generate返回的列表
+            semantic_sims: [num_iterations, B] 每轮的语义相似度
+            forbidden_dists: [num_iterations, B] 每轮的禁忌词距离
+        
+        Returns:
+            每轮的奖励详情列表
+        """
+        rewards = []
+        prev_output = None
+        
+        for i, iteration in enumerate(all_iterations):
+            guard_out = {
+                'safe_confidence': iteration['safe_conf'],
+                'harm_confidence': iteration['harm_conf'],
+                'notes_emb': iteration['guard_notes']
+            }
+            
+            reward_dict = self.compute(
+                guard_out,
+                semantic_sims[i],
+                forbidden_dists[i],
+                prev_guard_output=prev_output,
+                batch_size=iteration['safe_conf'].shape[0],
+                device=iteration['safe_conf'].device
+            )
+            
+            rewards.append({
+                'iteration': i,
+                **reward_dict
+            })
+            
+            prev_output = guard_out
+        
+        return rewards
 
 
-class XGuardMock(nn.Module):
-    """XGuard模拟器：评估Prompt安全性"""
-    def __init__(self, embed_dim=512):
+# ============================================
+# 修正后的Guard模拟器
+# ============================================
+
+class GuardMock(nn.Module):
+    """
+    Guard模拟器：模拟XGuard风格的输出
+    
+    输出格式对齐真实XGuard API：
+    - evaluate() 返回标准化dict，包含safe_confidence, harm_confidence, notes_emb
+    """
+    def __init__(self, embed_dim=512, num_risk_categories=10):
         super().__init__()
+        self.embed_dim = embed_dim
+        self.num_risk_categories = num_risk_categories
+        
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=embed_dim, nhead=8, batch_first=True,
             dim_feedforward=embed_dim * 2
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
-        self.classifier = nn.Linear(embed_dim, 1)
+        
+        # 多标签分类头（模拟XGuard的token_score输出）
+        self.safe_classifier = nn.Linear(embed_dim, 1)  # Safe vs Harmful
+        self.risk_classifier = nn.Linear(embed_dim, num_risk_categories)  # 细粒度风险类别
+        
+        # 反馈嵌入投影（用于AttackFormer的CrossAttention）
         self.notes_proj = nn.Linear(embed_dim, embed_dim)
+        
+        # 可学习的风险类别标签（模拟XGuard的token_score键）
+        self.register_buffer('risk_labels', torch.arange(num_risk_categories))
 
     def evaluate(self, token_ids, embeddings):
+        """
+        模拟Guard评估，返回XGuard风格的标准化输出
+        
+        Args:
+            token_ids: [B, S]
+            embeddings: [B, S, D]
+        
+        Returns:
+            Dict: {
+                'safe_confidence': [B] Safe标签置信度
+                'harm_confidence': [B] 最大有害标签置信度  
+                'predicted_label': [B] 0=Safe, 1=Harmful
+                'token_score': Dict[str, float] 模拟XGuard原始格式
+                'risk_score': Dict[str, float] 模拟XGuard原始格式
+                'notes_emb': [B, D] 反馈嵌入
+                'explanation': List[str] 文本解释
+            }
+        """
         B = token_ids.shape[0]
         h = self.encoder(embeddings)
-        pooled = h.mean(dim=1)
-        confidence = torch.sigmoid(self.classifier(pooled)).squeeze(-1)
+        pooled = h.mean(dim=1)  # [B, D]
+        
+        # Safe vs Harmful二分类
+        safe_logit = self.safe_classifier(pooled).squeeze(-1)  # [B]
+        safe_conf = torch.sigmoid(safe_logit)
+        
+        # 多风险类别（模拟XGuard的细粒度输出）
+        risk_logits = self.risk_classifier(pooled)  # [B, num_categories]
+        risk_probs = F.softmax(risk_logits, dim=-1)  # [B, num_categories]
+        
+        # 最大有害置信度（排除Safe类别，假设索引0是Safe）
+        harm_conf = risk_probs[:, 1:].max(dim=-1)[0]  # [B]
+        
+        # 预测标签
+        predicted_label = (safe_conf < 0.5).long()  # 0=Safe, 1=Harmful
+        
+        # 构造模拟的XGuard原始格式（用于兼容性）
+        token_scores = []
+        risk_scores = []
+        for b in range(B):
+            ts = {'sec': safe_conf[b].item()}
+            rs = {'Safe-Safe': safe_conf[b].item()}
+            for i in range(1, self.num_risk_categories):
+                label = f'risk_{i}'
+                ts[label] = risk_probs[b, i].item()
+                rs[f'Category-{label}'] = risk_probs[b, i].item()
+            token_scores.append(ts)
+            risk_scores.append(rs)
+        
+        # 反馈嵌入（用于AttackFormer的下一轮）
         notes_emb = self.notes_proj(pooled)
-        label = (confidence > 0.5).float()
+        
+        # 文本解释
+        explanations = []
+        for b in range(B):
+            if predicted_label[b] == 0:
+                explanations.append(f"Safe content detected with confidence {safe_conf[b]:.3f}")
+            else:
+                max_risk_idx = risk_probs[b, 1:].argmax().item() + 1
+                explanations.append(f"Risk detected: category {max_risk_idx} with confidence {harm_conf[b]:.3f}")
+        
         return {
-            'confidence': confidence,
+            'safe_confidence': safe_conf,
+            'harm_confidence': harm_conf,
+            'predicted_label': predicted_label,
+            'token_score': token_scores[0] if B == 1 else token_scores,  # 兼容单batch
+            'risk_score': risk_scores[0] if B == 1 else risk_scores,
             'notes_emb': notes_emb,
-            'label': label
+            'explanation': explanations
         }
 
 
@@ -567,11 +917,12 @@ class RolloutBuffer:
         self.rewards = []
         self.values = []
         self.dones = []
-        self.guard_signals = []      # 新增：记录Guard信号
-        self.iterations = []         # 新增：记录迭代轮数
+        self.guard_signals = []      # 记录Guard信号
+        self.guard_outputs = []      # 记录完整Guard输出（用于奖励计算）
+        self.iterations = []         # 记录迭代轮数
 
     def add(self, state, action, log_prob, reward, value, done,
-            guard_signal=None, iteration=0):
+            guard_signal=None, guard_output=None, iteration=0):
         self.states.append(state)
         self.actions.append(action)
         self.log_probs.append(log_prob)
@@ -579,9 +930,10 @@ class RolloutBuffer:
         self.values.append(value)
         self.dones.append(done)
         self.guard_signals.append(guard_signal)
+        self.guard_outputs.append(guard_output)
         self.iterations.append(iteration)
 
     def clear(self):
         for attr in ['states', 'actions', 'log_probs', 'rewards', 
-                     'values', 'dones', 'guard_signals', 'iterations']:
+                     'values', 'dones', 'guard_signals', 'guard_outputs', 'iterations']:
             getattr(self, attr).clear()

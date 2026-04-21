@@ -1,6 +1,6 @@
 # AttackFormer: Forbidden-Aware Adversarial Generation
 
-<img width="2387" height="3157" alt="image" src="https://github.com/user-attachments/assets/56122316-c08a-4578-bb58-eedbf9d22b9f" />
+<img width="1387" height="1987" alt="image" src="https://github.com/user-attachments/assets/fb05c36b-1a3b-475a-9ee3-500faa024347" />
 
 Guard Usage: Currently using XGuard (Alibaba) in experiments,the research I intended for is generative Guard like Xguard provided by Alibaba-AAIG.
 For real attack, the guard can be open-sourced model after alignment training, or the real guard in applications if you like.
@@ -150,6 +150,9 @@ Where:
   β = 0.5  (Stealth objective: Minimize XGuard detection confidence)
   γ = 0.8  (Forbidden avoidance objective: Maximize distance from statistical toxic token space)
 ```
+
+## Ways to Guard
+To avoid these kind of stealthy attack, reduce the propability of tthe assumptions that the secure limit of the Guard aligned with the LLM itself,from which make the assumption of guard and llm itself originated from the same distribution,or innovating a new aspect of llm downstreaming method.
 
 ## Citation
 

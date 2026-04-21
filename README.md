@@ -1,6 +1,6 @@
 # AttackFormer: Forbidden-Aware Adversarial Generation
 
-<img width="1987" height="2787" alt="image" src="https://github.com/user-attachments/assets/3309e9f0-46dd-4d59-923a-f181902cb7cf" />
+<img width="2387" height="3157" alt="image" src="https://github.com/user-attachments/assets/56122316-c08a-4578-bb58-eedbf9d22b9f" />
 
 Guard Usage: Currently using XGuard (Alibaba) in experiments,the research I intended for is generative Guard like Xguard provided by Alibaba-AAIG.
 For real attack, the guard can be open-sourced model after alignment training, or the real guard in applications if you like.

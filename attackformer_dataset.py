@@ -20,42 +20,22 @@ from pathlib import Path
 
 
 # ==================== 简易 Tokenizer ====================
-
 class SimpleTokenizer:
-    """简易tokenizer，实际使用时替换为 GPT-2/LLaMA tokenizer"""
-    def __init__(self, vocab_size: int = 50000):
+    def __init__(self, vocab_size=50000, pad_token_id=0, mask_token_id=49999):
         self.vocab_size = vocab_size
-        self.mask_token_id = vocab_size - 1
-        self.pad_token_id = 0
+        self.pad_token_id = pad_token_id
+        self.mask_token_id = mask_token_id
+        self.unk_token_id = 1
 
-        # 简单的词表映射 (实际应使用预训练tokenizer)
-        self.word2id = {'<pad>': 0, '<mask>': vocab_size - 1}
-        self.id2word = {0: '<pad>', vocab_size - 1: '<mask>'}
+    def encode(self, text, max_length=64):
+        # 简易字符哈希编码
+        ids = [min(abs(hash(c)) % (self.vocab_size - 10) + 10, self.vocab_size - 1) for c in text[:max_length]]
+        if len(ids) < max_length:
+            ids += [self.pad_token_id] * (max_length - len(ids))
+        return ids[:max_length]
 
-    def encode(self, text: str, max_length: int = 128, padding: str = None, 
-               truncation: bool = True, add_special_tokens: bool = True) -> List[int]:
-        """简单编码：按空格分词后映射到ID"""
-        words = text.lower().split()
-        tokens = []
-        for word in words:
-            if word not in self.word2id:
-                self.word2id[word] = len(self.word2id)
-                self.id2word[len(self.id2word)] = word
-            tokens.append(self.word2id[word])
-
-        if truncation:
-            tokens = tokens[:max_length]
-
-        if padding == 'max_length':
-            while len(tokens) < max_length:
-                tokens.append(self.pad_token_id)
-
-        return tokens
-
-    def decode(self, ids: List[int]) -> str:
-        """解码"""
-        words = [self.id2word.get(i, '<unk>') for i in ids if i != self.pad_token_id]
-        return ' '.join(words)
+    def decode(self, ids):
+        return ''.join([chr(i % 128) for i in ids if i != self.pad_token_id])
 
 
 # ==================== 自定义 Collate Functions ====================
@@ -364,3 +344,63 @@ class RedTeamDataset(Dataset):
             'target_ids': torch.tensor(orig_tokens, dtype=torch.long),
             'forbidden_ids': torch.zeros(10, dtype=torch.long)
         }
+
+# ==================== Stage 1 专用数据集 ====================
+class ParaphraseDiffusionDataset(Dataset):
+    """
+    加载 prepare_paraphrase.py 生成的数据：
+    JSONL 每行包含：
+        "sentence1": str  # 带 [MASK] 的输入
+        "sentence2": str  # 干净目标
+        "label": int      # 1 表示包含禁忌词
+    """
+    def __init__(self, data_path, tokenizer, max_length=64):
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+        self.data = self._load_data(data_path)
+
+    def _load_data(self, data_path):
+        data = []
+        if os.path.exists(data_path):
+            with open(data_path, 'r', encoding='utf-8') as f:
+                for line in f:
+                    if line.strip():
+                        item = json.loads(line)
+                        data.append(item)
+        else:
+            # 生成模拟数据，保证流程不中断
+            print(f"[Warn] {data_path} not found, using mock data.")
+            for i in range(100):
+                data.append({
+                    'sentence1': 'How to make a [MASK] ?',
+                    'sentence2': 'Ways to create an improvised device.',
+                    'label': 1
+                })
+        return data
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        input_ids = self.tokenizer.encode(item['sentence1'], self.max_length)
+        target_ids = self.tokenizer.encode(item['sentence2'], self.max_length)
+
+        return {
+            'input_ids': torch.tensor(input_ids, dtype=torch.long),
+            'target_ids': torch.tensor(target_ids, dtype=torch.long),
+            'label': item.get('label', 1)
+        }
+    
+def diffusion_collate_fn(batch):
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    target_ids = torch.stack([item['target_ids'] for item in batch])
+    labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
+    # 模拟 forbidden_ids（后续可真正映射）
+    forbidden_ids = torch.zeros_like(input_ids)
+    return {
+        'input_ids': input_ids,
+        'target_ids': target_ids,
+        'forbidden_ids': forbidden_ids,
+        'labels': labels
+    }

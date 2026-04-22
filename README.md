@@ -87,7 +87,17 @@ python prepare_paraphrase.py
 ### 3. Run Training
 
 ```bash
+# 完整训练
 python attackformer_train.py
+
+# 只训练 Stage 2（加载已有的 Stage1 模型）
+python attackformer_train.py --skip_stage1
+
+# 只评估已训练好的模型
+python attackformer_train.py --eval_only --load_checkpoint ./checkpoints/stage2_final.pt
+
+# 从某个 checkpoint 继续训练 Stage 2(example)
+python attackformer_train.py --skip_stage1 --load_checkpoint ./checkpoints/stage2_ep100.pt
 ```
 
 Complete training pipeline:

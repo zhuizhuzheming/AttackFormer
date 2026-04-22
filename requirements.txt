@@ -4,5 +4,4 @@ numpy
 tqdm 
 transformers
 matplotlib
-transformers
 sentence_transformers

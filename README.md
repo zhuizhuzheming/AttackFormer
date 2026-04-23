@@ -167,9 +167,9 @@ generated_ids, log_probs = model.generate_adversarial(
 print(tokenizer.decode(generated_ids[0]))
 ```
 
-# AttackFormer Hyperparameters
+## AttackFormer Hyperparameters
 
-## Model Architecture
+**Model Architecture**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -184,14 +184,14 @@ print(tokenizer.decode(generated_ids[0]))
 | `mask_token_id` | `49999` | Token ID used for masking during diffusion |
 | `pad_token_id` | `0` | Token ID used for padding |
 
-## Iterative Guard Amplification (Scaling)
+**Iterative Guard Amplification (Scaling)**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `max_guard_iterations` | `3` | Maximum number of iterative guard feedback loops |
 | `guard_signal_accum` | `True` | Whether to accumulate guard signals across iterations via gating |
 
-## PPO Training
+**PPO Training**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -201,7 +201,7 @@ print(tokenizer.decode(generated_ids[0]))
 | `gamma` | `0.99` | Discount factor for cumulative reward computation |
 | `gae_lambda` | `0.95` | Lambda parameter for Generalized Advantage Estimation (GAE) |
 
-## Reward Function Weights
+**Reward Function Weights**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -211,7 +211,7 @@ print(tokenizer.decode(generated_ids[0]))
 | `reward_weights['semantic']` | `0.15` | Weight for semantic similarity preservation reward |
 | `reward_weights['forbidden_dist']` | `0.10` | Weight for forbidden centroid distance reward |
 
-## Guard Model Configuration
+**Guard Model Configuration**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -220,13 +220,13 @@ print(tokenizer.decode(generated_ids[0]))
 | `xguard_device` | `"cuda"` | Device allocation for XGuard inference |
 | `target_llm_model_name_or_path` | `"Qwen/Qwen2.5-7B-Instruct"` | Target LLM to be red-teamed |
 
-## Auxiliary Paths
+**Auxiliary Paths**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `sentence_transformer_path` | `"./local_models/all-MiniLM-L6-v2"` | Local path for sentence transformer used in semantic anchor |
 
-## Runtime Configuration
+**Runtime Configuration**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|

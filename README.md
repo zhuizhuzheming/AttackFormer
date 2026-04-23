@@ -1,5 +1,23 @@
 # AttackFormer: Forbidden-Aware Adversarial Generation
 
+## Research Motivation
+
+Modern large language models (LLMs) have achieved remarkable capabilities across diverse tasks, yet their deployment in safety-critical applications remains vulnerable to adversarial prompt attacks. Existing red-teaming approaches predominantly rely on manual crafting or template-based perturbations, which suffer from three fundamental limitations: **(1)** poor scalability across different target models and guard systems; **(2)** lack of iterative feedback mechanisms that adapt to dynamic safety boundaries; and **(3)** insufficient preservation of semantic coherence, resulting in easily detectable adversarial artifacts. **(4)** From XGuard's technical report,I find that Xguard and Qwen's large language model application originating from one model architecture and training distribution,from which the stealer may use the perspective to learn jailbreak skills from the generative guard model.
+
+I identify a critical gap in current literature: the absence of a **closed-loop generative framework** that treats safety guard models not merely as evaluation black boxes, but as differentiable signal sources for iterative policy improvement. Specifically, I observe that guard models (e.g., XGuard) emit rich intermediate representations—confidence scores, risk embeddings, and explanatory hidden states—that are typically discarded after binary classification. This represents a significant untapped resource for guiding adversarial generation.
+
+To address these limitations, I propose **AttackFormer**, a diffusion-based iterative guard amplification framework with the following core motivations:
+
+1. **Guard Signal as Generative Guidance**: Unlike prior work that applies guard evaluation only at the final stage, I integrate guard hidden states (`notes_emb`) as cross-attention conditioning signals throughout the generation process. This enables the model to "anticipate" safety boundaries rather than blindly violating them.
+
+2. **Iterative Scaling via Signal Accumulation**: I introduce a learnable gating mechanism that accumulates guard signals across multiple generation rounds (`max_guard_iterations`), allowing the policy to progressively refine its understanding of the target guard's decision boundary. This mimics human red-teamers' iterative probing behavior.
+
+3. **Semantic-Preserving Adversarial Diffusion**: By combining time-conditional diffusion with a semantic anchor loss and dynamic residual connections, my framework ensures that adversarial perturbations maintain linguistic plausibility while evading detection—a crucial requirement for realistic security evaluation.
+
+4. **Adaptive Reward Composition**: I design an adaptive weighting scheme over five reward components (safe confidence, harm penalty, iterative improvement, semantic preservation, and forbidden distance), enabling the policy to dynamically balance exploration and exploitation during PPO training.
+
+My work is motivated by the urgent need for **automated, scalable, and semantically coherent red-teaming tools** that can keep pace with rapidly evolving LLM safety systems. By framing adversarial prompt generation as a reinforcement learning problem with guard-driven diffusion, AttackFormer establishes a principled foundation for next-generation AI safety evaluation.
+
 <img width="1993" height="2593" alt="image" src="https://github.com/user-attachments/assets/6f14d39e-6e6d-4029-b102-369523d08d03" />
 
 Guard Usage: Currently using XGuard (Alibaba) in experiments,the research I intended for is generative Guard like Xguard provided by Alibaba-AAIG.

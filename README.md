@@ -130,14 +130,6 @@ generated_ids, log_probs = model.generate_adversarial(
 print(tokenizer.decode(generated_ids[0]))
 ```
 
-## Model Architecture
-
-```
-Input Prompt → Input Embedding → Cross-Attention (Q:Prompt, K:Forbidden, V:XGuard) 
-    → Discrete Diffusion (Mask-Predict) → Output Projector → SwiGLU → Final Tokenizer
-    → Hard Vocab Mask → Adversarial Prompt
-```
-
 ## Key Hyperparameters
 
 | Parameter | Stage 1 | Stage 2 | Description |
@@ -150,16 +142,22 @@ Input Prompt → Input Embedding → Cross-Attention (Q:Prompt, K:Forbidden, V:X
 | γ (discount) | - | 0.99 | Discount factor |
 | λ (GAE) | - | 0.95 | Advantage estimation parameter |
 
-## Reward Function
+## Notice
+This repository provides the **full, research-ready implementation** of AttackFormer, including model architecture, training pipeline, reinforcement learning (PPO) logic, semantic anchoring, iterative guard amplification, and integration with Alibaba YuFeng-XGuard-Reason-8B.
 
-```
-R = α · I[Jailbreak Success] - β · XGuardConfidence + γ · ForbiddenDistance
+Due to **limited GPU resources**, I am not able to run full training or provide fine-tuned checkpoints and experimental results at this time.
 
-Where:
-  α = 1.0  (Primary objective: Trigger target LLM response)
-  β = 0.5  (Stealth objective: Minimize XGuard detection confidence)
-  γ = 0.8  (Forbidden avoidance objective: Maximize distance from statistical toxic token space)
-```
+The core idea, framework design, and code structure are **completely original**.
+Anyone is welcome to:
+- Reproduce the results
+- Finetune the model
+- Run experiments
+- Submit improvements via PR
+- Extend to other guard models or attack scenarios
+
+If you use this project in your research or development, please consider starring ⭐ and citing this repository.
+
+Community contributions are highly appreciated!
 
 ## Ways to Guard
 To avoid these kind of stealthy attack, reduce the propability of tthe assumptions that the secure limit of the Guard aligned with the LLM itself,from which make the assumption of guard and llm itself originated from the same distribution,or innovating a new aspect of llm downstreaming method.

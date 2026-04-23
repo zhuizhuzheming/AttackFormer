@@ -1,6 +1,6 @@
 # AttackFormer: Forbidden-Aware Adversarial Generation
 
-<img width="1387" height="1987" alt="image" src="https://github.com/user-attachments/assets/fb05c36b-1a3b-475a-9ee3-500faa024347" />
+<img width="1993" height="2593" alt="image" src="https://github.com/user-attachments/assets/6f14d39e-6e6d-4029-b102-369523d08d03" />
 
 Guard Usage: Currently using XGuard (Alibaba) in experiments,the research I intended for is generative Guard like Xguard provided by Alibaba-AAIG.
 For real attack, the guard can be open-sourced model after alignment training, or the real guard in applications if you like.
@@ -12,6 +12,25 @@ For real attack, the guard can be open-sourced model after alignment training, o
 - **Hard Vocab Mask**: Hard constraint on action space, completely preventing generation of statistically forbidden tokens
 - **Soft Embed Penalty**: Learnable negative prior, continuously pushing embeddings away from forbidden centroids
 - **Semantic Anchor**: Semantic anchor to prevent reward hacking
+
+## Notice
+This repository provides the **full, research-ready implementation** of AttackFormer, including model architecture, training pipeline, reinforcement learning (PPO) logic, semantic anchoring, iterative guard amplification, and integration with Alibaba YuFeng-XGuard-Reason-8B.
+
+Due to **limited resources or time**, I am not able to run full training or provide fine-tuned checkpoints and experimental results at this time.
+
+The core idea, framework design, and code structure are **completely original**.
+
+Contributions for the following tasks are highly welcome:
+- Reproduce the results
+- Finetune the model
+- Run experiments
+- Submit improvements via PR
+- Extend to other guard models or attack scenarios
+- Anything which considered to make great progress to the project. 
+
+If you use this project in your research or development, please consider starring ⭐ and citing this repository.
+
+Community contributions are highly appreciated!
 
 ## File Structure
 
@@ -130,34 +149,72 @@ generated_ids, log_probs = model.generate_adversarial(
 print(tokenizer.decode(generated_ids[0]))
 ```
 
-## Key Hyperparameters
+# AttackFormer Hyperparameters
 
-| Parameter | Stage 1 | Stage 2 | Description |
-|-----------|---------|---------|-------------|
-| Learning Rate | 1e-4 | 5e-5 | Smaller in Stage 2 to prevent disrupting pretrained weights |
-| Batch Size | 32 | 8 | Stage 2 requires generation, higher memory consumption |
-| Epochs/Episodes | 10 | 1000 | Stage 2 uses episode-based training |
-| Mask Probability | 0.15 | - | Stage 1 simulates diffusion |
-| PPO Clip ε | - | 0.2 | Policy update constraint |
-| γ (discount) | - | 0.99 | Discount factor |
-| λ (GAE) | - | 0.95 | Advantage estimation parameter |
+## Model Architecture
 
-## Notice
-This repository provides the **full, research-ready implementation** of AttackFormer, including model architecture, training pipeline, reinforcement learning (PPO) logic, semantic anchoring, iterative guard amplification, and integration with Alibaba YuFeng-XGuard-Reason-8B.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `vocab_size` | `50000` | Vocabulary size of the tokenizer |
+| `embed_dim` | `512` | Dimension of token embeddings and hidden states |
+| `num_heads` | `8` | Number of attention heads in Transformer layers |
+| `num_layers` | `6` | Number of Transformer encoder layers |
+| `ff_dim` | `2048` | Feed-forward network intermediate dimension |
+| `max_seq_len` | `128` | Maximum sequence length for input prompts |
+| `forbidden_vocab_size` | `1000` | Size of the forbidden vocabulary subset |
+| `diffusion_steps` | `10` | Number of diffusion timesteps for iterative generation |
+| `mask_token_id` | `49999` | Token ID used for masking during diffusion |
+| `pad_token_id` | `0` | Token ID used for padding |
 
-Due to **limited GPU resources**, I am not able to run full training or provide fine-tuned checkpoints and experimental results at this time.
+## Iterative Guard Amplification (Scaling)
 
-The core idea, framework design, and code structure are **completely original**.
-Anyone is welcome to:
-- Reproduce the results
-- Finetune the model
-- Run experiments
-- Submit improvements via PR
-- Extend to other guard models or attack scenarios
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `max_guard_iterations` | `3` | Maximum number of iterative guard feedback loops |
+| `guard_signal_accum` | `True` | Whether to accumulate guard signals across iterations via gating |
 
-If you use this project in your research or development, please consider starring ⭐ and citing this repository.
+## PPO Training
 
-Community contributions are highly appreciated!
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `ppo_clip_eps` | `0.2` | Clipping epsilon for PPO surrogate objective |
+| `ppo_value_coef` | `0.5` | Coefficient for value function loss |
+| `ppo_entropy_coef` | `0.01` | Coefficient for entropy bonus in policy loss |
+| `gamma` | `0.99` | Discount factor for cumulative reward computation |
+| `gae_lambda` | `0.95` | Lambda parameter for Generalized Advantage Estimation (GAE) |
+
+## Reward Function Weights
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `reward_weights['guard_safe_conf']` | `0.35` | Weight for guard safe confidence reward |
+| `reward_weights['guard_harm_penalty']` | `0.25` | Weight for guard harmful content penalty |
+| `reward_weights['iterative_improve']` | `0.15` | Weight for iterative improvement reward (delta between iterations) |
+| `reward_weights['semantic']` | `0.15` | Weight for semantic similarity preservation reward |
+| `reward_weights['forbidden_dist']` | `0.10` | Weight for forbidden centroid distance reward |
+
+## Guard Model Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `guard_type` | `"real_xguard"` | Guard backend type: `"mock"` for simulated guard, `"real_xguard"` for production XGuard |
+| `xguard_model_name_or_path` | `"Alibaba-AAIG/YuFeng-XGuard-Reason-8B"` | Model identifier or local path for XGuard |
+| `xguard_device` | `"cuda"` | Device allocation for XGuard inference |
+| `target_llm_model_name_or_path` | `"Qwen/Qwen2.5-7B-Instruct"` | Target LLM to be red-teamed |
+
+## Auxiliary Paths
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `sentence_transformer_path` | `"./local_models/all-MiniLM-L6-v2"` | Local path for sentence transformer used in semantic anchor |
+
+## Runtime Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `stage` | `"offline"` | Training stage: `"offline"` for pre-training, `"online"` for interactive deployment |
+| `forbidden_token_ids` | `None` | Optional list of pre-computed forbidden token IDs for hard masking |
+
 
 ## Ways to Guard
 To avoid these kind of stealthy attack, reduce the propability of tthe assumptions that the secure limit of the Guard aligned with the LLM itself,from which make the assumption of guard and llm itself originated from the same distribution,or innovating a new aspect of llm downstreaming method.

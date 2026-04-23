@@ -18,7 +18,7 @@ To address these limitations, I propose **AttackFormer**, a diffusion-based iter
 
 My work is motivated by the urgent need for **automated, scalable, and semantically coherent red-teaming tools** that can keep pace with rapidly evolving LLM safety systems. By framing adversarial prompt generation as a reinforcement learning problem with guard-driven diffusion, AttackFormer establishes a principled foundation for next-generation AI safety evaluation.
 
-<img width="1993" height="2593" alt="image" src="https://github.com/user-attachments/assets/6f14d39e-6e6d-4029-b102-369523d08d03" />
+<img width="1244" height="1142" alt="image" src="https://github.com/user-attachments/assets/2a32c048-afe6-4804-a495-1d7e9954d2b0" />
 
 Guard Usage: Currently using XGuard (Alibaba) in experiments,the research I intended for is generative Guard like Xguard provided by Alibaba-AAIG.
 For real attack, the guard can be open-sourced model after alignment training, or the real guard in applications if you like.

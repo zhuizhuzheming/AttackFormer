@@ -217,7 +217,7 @@ class GuardDrivenCrossAttention(nn.Module):
     def forward(self, guard_label, prompt_emb, prev_guard_signal=None):
         """
         Args:
-            guard_label: (B, D) Guard 输出的 label/notes 嵌入
+            guard_label: (B, D) Guard 输出的 label/notes 嵌入 (作为 Query)
             prompt_emb: (B, S, D) Prompt 的 token 嵌入 (作为 KV)
             prev_guard_signal: (B, D) 前一轮累积的 Guard 信号
         Returns:
@@ -226,6 +226,7 @@ class GuardDrivenCrossAttention(nn.Module):
             accumulated_signal: (B, D) 累积后的 Guard 信号
         """
         B, S, D = prompt_emb.shape
+        # guard_label 已作为参数名传入
 
         # 信号累积门控
         if prev_guard_signal is not None and self.training:
@@ -385,7 +386,7 @@ class TokenMixJail(nn.Module):
         # Step 1: Guard-driven Cross Attention
         # Q=guard_label, KV=prompt_emb
         context, attn_weights, acc_signal = self.guard_attention(
-            guard_signal=guard_label, 
+            guard_label=guard_label, 
             prompt_emb=prompt_emb,
             prev_guard_signal=None  # 外部处理累积
         )

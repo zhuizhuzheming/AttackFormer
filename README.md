@@ -41,8 +41,11 @@ Community contributions are highly appreciated!
 ## File Structure
 
 ```
+attackformer_dataset.py  # Complete dataset definitions
 attackformer_model.py    # Complete model definitions (AttackFormer, VocabConstraint, CrossAttention, etc.)
 attackformer_train.py    # Complete training pipeline (dataset loaders + two-stage training + evaluation)
+prepare_paraphrase.py    # Dataset preparation
+requirements.txt         # Require installs.
 ```
 
 ## Recommended Datasets

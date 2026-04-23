@@ -4,6 +4,8 @@ attackformer_train.py
 - Stage 1: 使用 prepare_paraphrase.py 生成的 diffusion 预训练数据 (sentence1/sentence2)
 - Stage 2: 使用真实 XGuard + Qwen 进行迭代式 Guard 增强 PPO
 - 支持本地离线模型加载
+
+适配 TokenMixJail-Centric 架构 (SwiGLU + Guard 双输出)
 """
 
 import torch
@@ -33,9 +35,9 @@ from attackformer_model import (
 )
 
 from attackformer_dataset import(
-    SimpleTokenizer,diffusion_collate_fn,ParaphraseDiffusionDataset,
-    paraphrase_collate_fn,jailbreak_collate_fn,
-    ParaphraseDataset,JailbreakDataset,
+    SimpleTokenizer, diffusion_collate_fn, ParaphraseDiffusionDataset,
+    paraphrase_collate_fn, jailbreak_collate_fn,
+    ParaphraseDataset, JailbreakDataset,
     RedTeamDataset
 )
 
@@ -55,7 +57,6 @@ class SemanticEncoder:
             try:
                 import logging
                 from sentence_transformers import SentenceTransformer
-                # 减少冗余日志
                 logging.getLogger("sentence_transformers").setLevel(logging.WARNING)
                 logging.getLogger("transformers").setLevel(logging.WARNING)
 
@@ -138,7 +139,7 @@ def plot_stage1_curves(history, save_path):
         return
     epochs = history['stage1']['epochs']
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    fig.suptitle('Stage 1: Offline Pre-training (Diffusion)', fontsize=14, fontweight='bold')
+    fig.suptitle('Stage 1: Offline Pre-training (Diffusion with SwiGLU)', fontsize=14, fontweight='bold')
     metrics = [
         (history['stage1']['loss'], 'Total Loss', 'b-o'),
         (history['stage1']['semantic'], 'Semantic Loss', 'g-s'),
@@ -155,7 +156,7 @@ def plot_stage2_curves(history, save_path):
         return
     episodes = history['stage2']['episodes']
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
-    fig.suptitle('Stage 2: Iterative Guard Amplification', fontsize=14, fontweight='bold')
+    fig.suptitle('Stage 2: Iterative Guard Amplification (TokenMixJail-Centric)', fontsize=14, fontweight='bold')
     metrics = [
         (history['stage2']['reward'], 'Avg Reward', 'b-o'),
         (history['stage2']['guard_pass'], 'Guard Pass Rate', 'g-s'),
@@ -252,8 +253,9 @@ class AttackFormerTrainer:
     def stage1_offline_pretrain(self, dataloader, epochs=10, save_every=2):
         """
         Stage 1: 使用扩散预训练数据 (sentence1 -> sentence2)
+        TokenMixJail 内部使用 SwiGLU FFN
         """
-        print(f"\n===== Stage 1: Diffusion Pre-training =====")
+        print(f"\n===== Stage 1: Diffusion Pre-training (SwiGLU FFN) =====")
         self.model.train()
         best_loss = float('inf')
 
@@ -264,20 +266,20 @@ class AttackFormerTrainer:
 
             pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{epochs}")
             for batch in pbar:
-                input_ids = batch['input_ids'].to(self.device)       # 带 [MASK] 的输入
-                target_ids = batch['target_ids'].to(self.device)     # 干净目标
+                input_ids = batch['input_ids'].to(self.device)
+                target_ids = batch['target_ids'].to(self.device)
                 forbidden_ids = batch['forbidden_ids'].to(self.device)
 
                 B = input_ids.shape[0]
                 t = torch.randint(0, self.config.diffusion_steps + 1, (B,), device=self.device)
                 guard_signal = torch.zeros(B, self.config.embed_dim, device=self.device)
 
-                # 前向传播：使用 input_ids 作为输入，original_ids 设为 target_ids 以计算语义损失
+                # 前向传播: TokenMixJail 内部使用 SwiGLU
                 outputs = self.model(input_ids, forbidden_ids, guard_signal,
                                      time_step=t, original_ids=target_ids)
                 logits = outputs['logits']
 
-                # 交叉熵：预测 target_ids
+                # 交叉熵: 预测 target_ids
                 loss = F.cross_entropy(
                     logits.view(-1, self.config.vocab_size),
                     target_ids.view(-1),
@@ -329,13 +331,15 @@ class AttackFormerTrainer:
         max_iterations: int = 3
     ):
         """
-        Stage 2: 迭代式 Guard 增强 PPO（Scaling 核心）
-        新增特性：
-        - tqdm 进度条显示当前 episode 进度和关键指标
-        - 每 10 个 episode 打印详细统计（原为 100）
-        - 可选加速：减少 max_iterations 或使用 mock guard
+        Stage 2: 迭代式 Guard 增强 PPO（TokenMixJail-Centric）
+
+        迭代流程 (×N):
+          1. Guard 评估 → 输出 prompt_emb + notes_emb
+          2. TokenMixJail (notes_emb 作为 Query, prompt_emb 作为 KV)
+          3. 生成下一 token → 累积序列
+          4. 下一轮使用新 prompt 重新评估 Guard
         """
-        print(f"\n===== Stage 2: Iterative Guard Amplification =====")
+        print(f"\n===== Stage 2: Iterative Guard Amplification (TokenMixJail-Centric) =====")
         print(f"Guard type: {self.config.guard_type}")
         print(f"Adaptive reward weights: {self.reward_fn.adaptive}")
         print(f"Max iterations per episode: {max_iterations}")
@@ -343,16 +347,13 @@ class AttackFormerTrainer:
         self.reward_fn.train()
         semantic_encoder = self._get_semantic_encoder()
 
-        # 指标收集（滑动窗口大小 100）
         episode_metrics = {
             'rewards': [], 'guard_pass': [], 'safe_conf': [], 'harm_conf': [],
             'iter_improve': [], 'semantic': [], 'avg_iters': []
         }
 
-        # 使用 tqdm 显示进度
         pbar = tqdm(range(num_episodes), desc="Stage 2 Episodes", unit="ep", ncols=120)
         for episode in pbar:
-            # 获取一个 batch（循环迭代 dataloader）
             try:
                 batch = next(iter(prompt_dataloader))
             except StopIteration:
@@ -370,7 +371,7 @@ class AttackFormerTrainer:
             B = original_ids.shape[0]
             original_texts = batch.get('texts', [''] * B)
 
-            # 迭代生成对抗样本
+            # 迭代生成对抗样本 (TokenMixJail-Centric 流程)
             all_iterations = self.model.iterative_generate(
                 original_ids, forbidden_ids, self.guard,
                 max_length=self.config.max_seq_len,
@@ -380,7 +381,7 @@ class AttackFormerTrainer:
                 forbidden_word_lists=forbidden_word_lists
             )
 
-            # 选择最佳迭代轮次（Safe 置信度最高，Harm 置信度最低）
+            # 选择最佳迭代轮次
             best_idx = max(range(len(all_iterations)),
                           key=lambda i: all_iterations[i]['safe_conf'].mean() - all_iterations[i]['harm_conf'].mean())
             best_result = all_iterations[best_idx]
@@ -400,16 +401,18 @@ class AttackFormerTrainer:
                     'safe_confidence': prev['safe_conf'],
                     'harm_confidence': prev['harm_conf'],
                     'predicted_label': prev['predicted_label'],
-                    'notes_emb': prev['guard_notes']
+                    'notes_emb': prev['guard_notes'],
+                    'prompt_emb': prev.get('guard_prompt', prev['guard_notes'])  # 适配双输出
                 }
             current_guard_output = {
                 'safe_confidence': safe_conf,
                 'harm_confidence': harm_conf,
                 'predicted_label': predicted_label,
-                'notes_emb': guard_notes
+                'notes_emb': guard_notes,
+                'prompt_emb': best_result.get('guard_prompt', guard_notes)  # 适配双输出
             }
 
-            # 计算语义相似度（使用 SentenceTransformer 或模拟编码器）
+            # 计算语义相似度
             adv_texts = best_result.get('texts', [])
             if original_texts and adv_texts:
                 orig_emb = semantic_encoder.encode(original_texts, convert_to_tensor=True)
@@ -464,7 +467,7 @@ class AttackFormerTrainer:
                 improve = F.relu(safe_conf - prev_guard_output['safe_confidence']).mean().item()
                 episode_metrics['iter_improve'].append(improve)
 
-            # 更新 tqdm 进度条的后缀信息（显示最近一个 episode 的指标）
+            # 更新 tqdm 进度条
             pbar.set_postfix({
                 'R': f"{rewards.mean().item():.2f}",
                 'Pass': f"{episode_metrics['guard_pass'][-1]:.1%}",
@@ -477,7 +480,7 @@ class AttackFormerTrainer:
                 self._ppo_update(ppo_epochs)
                 self.buffer.clear()
 
-            # 每 10 个 episode 打印一次详细统计（原为 100，加快反馈）
+            # 每 10 个 episode 打印详细统计
             if episode % 10 == 0 and episode > 0:
                 self._log_progress(episode, episode_metrics, reward_dict['weights'])
                 self._save_history(episode, episode_metrics, all_iterations, reward_dict['weights'])
@@ -511,6 +514,7 @@ class AttackFormerTrainer:
                 gs = gs.unsqueeze(0).to(self.device) if gs is not None else \
                      torch.zeros(1, self.config.embed_dim, device=self.device)
 
+                # 使用 TokenMixJail 进行前向传播
                 outputs = self.model(
                     orig_ids, forb_ids, gs,
                     return_value=True,
@@ -618,7 +622,6 @@ class AttackFormerTrainer:
         print(f"Checkpoint saved to {path}")
 
     def load_checkpoint(self, path):
-        # 修复 PyTorch 2.6+ 的 weights_only 问题
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         if 'diffusion_optimizer' in checkpoint:
@@ -655,6 +658,7 @@ class AttackFormerTrainer:
                 B = original_ids.shape[0]
                 original_texts = batch.get('texts', [''] * B)
 
+                # 使用 TokenMixJail-Centric 迭代生成
                 result = self.model.iterative_generate(
                     original_ids, forbidden_ids, self.guard,
                     max_length=self.config.max_seq_len,
@@ -701,21 +705,20 @@ class AttackFormerTrainer:
 # ==================== 主函数 ====================
 
 def main():
-    parser = argparse.ArgumentParser(description="AttackFormer Training & Evaluation")
+    parser = argparse.ArgumentParser(description="AttackFormer Training & Evaluation (TokenMixJail-Centric)")
     parser.add_argument("--skip_stage1", action="store_true", help="Skip Stage 1 pre-training")
     parser.add_argument("--skip_stage2", action="store_true", help="Skip Stage 2 PPO training")
     parser.add_argument("--eval_only", action="store_true", help="Only run evaluation (requires --load_checkpoint)")
-    parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to checkpoint to load before training/evaluation")
+    parser.add_argument("--load_checkpoint", type=str, default=None, help="Path to checkpoint to load")
     parser.add_argument("--stage1_epochs", type=int, default=10, help="Number of epochs for Stage 1")
     parser.add_argument("--stage2_episodes", type=int, default=500, help="Number of episodes for Stage 2")
     args = parser.parse_args()
 
-    # 本地模型路径配置（请根据实际下载位置修改）
+    # 本地模型路径配置
     LOCAL_XGUARD_PATH = "./local_models/YuFeng-XGuard-Reason-8B"
     LOCAL_QWEN_PATH = "./local_models/Qwen2.5-7B-Instruct"
     LOCAL_SENTENCE_TRANSFORMER_PATH = "./local_models/all-MiniLM-L6-v2"
 
-    # 如果本地存在则使用本地路径，否则使用远程名称（需要网络）
     xguard_path = LOCAL_XGUARD_PATH if os.path.exists(LOCAL_XGUARD_PATH) else "Alibaba-AAIG/YuFeng-XGuard-Reason-8B"
     qwen_path = LOCAL_QWEN_PATH if os.path.exists(LOCAL_QWEN_PATH) else "Qwen/Qwen2.5-7B-Instruct"
     SemanticEncoder.set_local_path(LOCAL_SENTENCE_TRANSFORMER_PATH)
@@ -725,6 +728,8 @@ def main():
         embed_dim=512,
         num_heads=8,
         num_layers=6,
+        ff_dim=2048,
+        swiglu_dim=1365,  # 2/3 * ff_dim, 保持参数量一致
         max_seq_len=64,
         forbidden_vocab_size=1000,
         diffusion_steps=10,
@@ -744,20 +749,19 @@ def main():
     device = config.xguard_device
     print(f"Using device: {device}")
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    print(f"SwiGLU hidden dim: {config.swiglu_dim} (2/3 of ff_dim={config.ff_dim})")
 
     trainer = AttackFormerTrainer(
         model, config, device=device, save_dir='./checkpoints',
         adaptive_reward=True
     )
 
-    # 如果指定了 checkpoint，先加载
     if args.load_checkpoint:
         trainer.load_checkpoint(args.load_checkpoint)
 
-    # 仅评估模式
     if args.eval_only:
         if not args.load_checkpoint:
-            print("Error: --eval_only requires --load_checkpoint to specify a model checkpoint.")
+            print("Error: --eval_only requires --load_checkpoint")
             return
         print("Running evaluation only...")
         target_llm = TargetLLM(model_name_or_path=config.target_llm_model_name_or_path, device=device)
@@ -797,7 +801,6 @@ def main():
 
     # ========== Stage 2 ==========
     if not args.skip_stage2:
-        # 如果跳过 Stage1 且没有手动加载 checkpoint，尝试自动加载 stage1_best
         if args.skip_stage1 and not args.load_checkpoint:
             default_ckpt = './checkpoints/stage1_best.pt'
             if os.path.exists(default_ckpt):

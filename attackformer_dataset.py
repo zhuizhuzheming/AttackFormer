@@ -1,6 +1,8 @@
 """
 attackformer_dataset.py
 数据集定义、简易 Tokenizer、自定义 Collate Functions
+
+适配 TokenMixJail-Centric 架构 (SwiGLU + Guard 双输出)
 """
 
 import torch
@@ -44,28 +46,26 @@ class SimpleTokenizer:
 def paraphrase_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
     """
     自定义 collate function 处理 ParaphraseDataset 的变长数据
-    
+
     问题：mask_positions 是变长列表（每个样本 mask 数量不同）
     解决：对变长字段使用 padding，对固定长度字段直接 stack
     """
-    # 分离不同字段
     original_ids = torch.stack([item['original_ids'] for item in batch])
     noisy_ids = torch.stack([item['noisy_ids'] for item in batch])
     target_ids = torch.stack([item['target_ids'] for item in batch])
     forbidden_ids = torch.stack([item['forbidden_ids'] for item in batch])
-    
+
     # 处理变长的 mask_positions：使用 -1 填充
     mask_positions_list = [item['mask_positions'] for item in batch]
     max_len = max(len(pos) for pos in mask_positions_list) if mask_positions_list else 0
     max_len = max(max_len, 1)  # 至少长度为1，避免空张量
-    
-    # 创建填充后的张量 [batch_size, max_len]
+
     mask_positions_padded = torch.full((len(batch), max_len), -1, dtype=torch.long)
     for i, positions in enumerate(mask_positions_list):
         if len(positions) > 0:
             actual_len = min(len(positions), max_len)
             mask_positions_padded[i, :actual_len] = positions[:actual_len]
-    
+
     return {
         'original_ids': original_ids,
         'noisy_ids': noisy_ids,
@@ -76,6 +76,7 @@ def paraphrase_collate_fn(batch: List[Dict]) -> Dict[str, torch.Tensor]:
 
 
 def jailbreak_collate_fn(batch):
+    """Jailbreak 数据集 collate：适配 TokenMixJail 的 Guard 双输出"""
     original_ids = torch.stack([item['original_ids'] for item in batch])
     forbidden_ids = torch.stack([item['forbidden_ids'] for item in batch])
     texts = [item['text'] for item in batch]
@@ -88,6 +89,21 @@ def jailbreak_collate_fn(batch):
     }
 
 
+def diffusion_collate_fn(batch):
+    """扩散预训练 collate：适配 TokenMixJail 的 SwiGLU 扩散"""
+    input_ids = torch.stack([item['input_ids'] for item in batch])
+    target_ids = torch.stack([item['target_ids'] for item in batch])
+    labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
+    # 模拟 forbidden_ids（后续可真正映射）
+    forbidden_ids = torch.zeros_like(input_ids)
+    return {
+        'input_ids': input_ids,
+        'target_ids': target_ids,
+        'forbidden_ids': forbidden_ids,
+        'labels': labels
+    }
+
+
 # ==================== 数据集定义 ====================
 
 class ParaphraseDataset(Dataset):
@@ -95,6 +111,8 @@ class ParaphraseDataset(Dataset):
     Stage 1 预训练数据集
     用于离散扩散去噪预训练，学习语义保持的改写能力
     支持: ParaNMT, QQP, MRPC 等语义等价对
+
+    适配 TokenMixJail: 输入带 [MASK] 的 sentence1，目标为 sentence2
     """
     def __init__(
         self, 
@@ -177,28 +195,39 @@ class ParaphraseDataset(Dataset):
                 noisy_tokens[i] = self.tokenizer.mask_token_id
                 mask_positions.append(i)
 
-        # 返回变长的 mask_positions，由 collate_fn 处理 padding
         return {
             'original_ids': torch.tensor(orig_tokens, dtype=torch.long),
             'noisy_ids': torch.tensor(noisy_tokens, dtype=torch.long),
             'target_ids': torch.tensor(para_tokens, dtype=torch.long),
-            'mask_positions': torch.tensor(mask_positions, dtype=torch.long),  # 变长，collate_fn 会处理
-            'forbidden_ids': torch.zeros(10, dtype=torch.long)  # 占位
+            'mask_positions': torch.tensor(mask_positions, dtype=torch.long),
+            'forbidden_ids': torch.zeros(10, dtype=torch.long)
         }
 
 
 class JailbreakDataset(Dataset):
+    """
+    Jailbreak 数据集：适配 TokenMixJail 的迭代生成
+
+    每样本包含:
+      - original_ids: 原始 prompt token IDs
+      - forbidden_ids: 禁忌词 IDs
+      - texts: 原始文本（用于 Guard 评估和语义相似度）
+      - forbidden_words: 该样本包含的禁忌词列表（用于 Guard 动态注入）
+    """
     def __init__(self, data_path=None, tokenizer=None, forbidden_vocab_path=None, max_length=64):
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.data = []
         self.forbidden_words = []
+
+        # 加载禁忌词表
         if forbidden_vocab_path and os.path.exists(forbidden_vocab_path):
             with open(forbidden_vocab_path, 'r', encoding='utf-8') as f:
                 self.forbidden_words = [line.strip() for line in f if line.strip()]
         else:
             self.forbidden_words = ["bomb", "hack", "illegal", "violence", "drug"]
 
+        # 加载数据
         if data_path and os.path.exists(data_path):
             if data_path.endswith('.csv'):
                 with open(data_path, 'r', encoding='utf-8') as f:
@@ -228,6 +257,7 @@ class JailbreakDataset(Dataset):
         token_ids = self.tokenizer.encode(text, self.max_length)
         original_ids = torch.tensor(token_ids, dtype=torch.long)
         forbidden_ids = torch.randint(0, 1000, (self.max_length,), dtype=torch.long)
+        # 提取该样本包含的禁忌词（用于 Guard 动态注入）
         sample_forbidden = [w for w in self.forbidden_words if w in text.lower()]
         return {
             'original_ids': original_ids,
@@ -236,9 +266,11 @@ class JailbreakDataset(Dataset):
             'forbidden_words': sample_forbidden
         }
 
+
 class RedTeamDataset(Dataset):
     """
     HH-RLHF 红队数据集 (无害化处理后用于预训练)
+    适配 TokenMixJail 的 SwiGLU 扩散预训练
     """
     def __init__(self, data_path: str, tokenizer, max_length: int = 128):
         self.tokenizer = tokenizer
@@ -280,14 +312,17 @@ class RedTeamDataset(Dataset):
             'forbidden_ids': torch.zeros(10, dtype=torch.long)
         }
 
-# ==================== Stage 1 专用数据集 ====================
+
 class ParaphraseDiffusionDataset(Dataset):
     """
+    Stage 1 专用扩散数据集
     加载 prepare_paraphrase.py 生成的数据：
     JSONL 每行包含：
         "sentence1": str  # 带 [MASK] 的输入
         "sentence2": str  # 干净目标
         "label": int      # 1 表示包含禁忌词
+
+    适配 TokenMixJail 的 SwiGLU 扩散预训练
     """
     def __init__(self, data_path, tokenizer, max_length=64):
         self.tokenizer = tokenizer
@@ -326,16 +361,3 @@ class ParaphraseDiffusionDataset(Dataset):
             'target_ids': torch.tensor(target_ids, dtype=torch.long),
             'label': item.get('label', 1)
         }
-    
-def diffusion_collate_fn(batch):
-    input_ids = torch.stack([item['input_ids'] for item in batch])
-    target_ids = torch.stack([item['target_ids'] for item in batch])
-    labels = torch.tensor([item['label'] for item in batch], dtype=torch.long)
-    # 模拟 forbidden_ids（后续可真正映射）
-    forbidden_ids = torch.zeros_like(input_ids)
-    return {
-        'input_ids': input_ids,
-        'target_ids': target_ids,
-        'forbidden_ids': forbidden_ids,
-        'labels': labels
-    }

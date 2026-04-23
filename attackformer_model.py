@@ -1,6 +1,11 @@
 """
 AttackFormer: Iterative Guard Amplification (Scaling)
-完整实现版 - 支持本地XGuard模型 + 动态规则 + 灵活扩展
+TokenMixJail-Centric Architecture — Refactored Edition
+核心修改：
+  1. SwiGLU 激活函数替代 GELU
+  2. TokenMixJail 封装 CrossAttn → Diffusion → SwiGLU → Tokenize
+  3. Guard 双输出：prompt_emb + notes_emb (label)
+  4. 外层迭代循环 ×N: Guard → TokenMixJail → SwiGLU → Tokenize
 """
 
 import torch
@@ -19,7 +24,8 @@ class AttackFormerConfig:
     embed_dim: int = 512
     num_heads: int = 8
     num_layers: int = 6
-    ff_dim: int = 2048
+    ff_dim: int = 2048          # 标准 FFN 中间维度
+    swiglu_dim: int = 1365      # SwiGLU 隐藏维度 ≈ 2/3 * ff_dim (保持参数量一致)
     max_seq_len: int = 128
     forbidden_vocab_size: int = 1000
     diffusion_steps: int = 10
@@ -59,6 +65,84 @@ class AttackFormerConfig:
     forbidden_token_ids: Optional[List[int]] = None
 
 
+# ============================================
+# SwiGLU 激活函数
+# ============================================
+class SwiGLU(nn.Module):
+    """
+    SwiGLU Feed-Forward Network
+    公式: SwiGLU(x) = Swish(xW1) ⊙ (xW2)  —— 然后投影回原始维度
+    参考: LLaMA / PaLM 架构 [^4^][^6^]
+
+    参数控制：
+      - hidden_dim = 2/3 * ff_dim (保持与标准FFN相当的参数量)
+      - 使用 SiLU (即 Swish with β=1) 作为门控激活
+    """
+    def __init__(self, config: AttackFormerConfig):
+        super().__init__()
+        self.embed_dim = config.embed_dim
+        # SwiGLU 隐藏维度：2/3 * ff_dim，保持参数量与标准 FFN 一致 [^6^]
+        self.hidden_dim = config.swiglu_dim if config.swiglu_dim else int(2 * config.ff_dim / 3)
+
+        # 三个线性投影 (LLaMA 风格) [^4^]
+        self.w1 = nn.Linear(config.embed_dim, self.hidden_dim, bias=False)  # gate projection
+        self.w2 = nn.Linear(config.embed_dim, self.hidden_dim, bias=False)  # up projection  
+        self.w3 = nn.Linear(self.hidden_dim, config.embed_dim, bias=False)   # down projection
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # SiLU(xW1) 作为 Swish 门控 [^5^]
+        gate = F.silu(self.w1(x))
+        # 数据分支
+        up = self.w2(x)
+        # 门控融合 + 投影回原始维度
+        hidden = gate * up
+        hidden = self.dropout(hidden)
+        return self.w3(hidden)
+
+
+# ============================================
+# SwiGLU Transformer Encoder Layer
+# ============================================
+class SwiGLUTransformerLayer(nn.Module):
+    """
+    Transformer Encoder Layer with SwiGLU FFN (替换标准 GELU)
+    Pre-Norm 架构: LayerNorm → Attention → Residual → LayerNorm → SwiGLU → Residual
+    """
+    def __init__(self, config: AttackFormerConfig):
+        super().__init__()
+        self.embed_dim = config.embed_dim
+        self.num_heads = config.num_heads
+
+        # Self-Attention
+        self.self_attn = nn.MultiheadAttention(
+            config.embed_dim, config.num_heads, 
+            dropout=0.1, batch_first=True
+        )
+        self.norm1 = nn.LayerNorm(config.embed_dim)
+        self.dropout1 = nn.Dropout(0.1)
+
+        # SwiGLU FFN (替换标准 Linear→GELU→Linear)
+        self.swiglu = SwiGLU(config)
+        self.norm2 = nn.LayerNorm(config.embed_dim)
+        self.dropout2 = nn.Dropout(0.1)
+
+    def forward(self, x: torch.Tensor, attn_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        # Pre-Norm Self-Attention
+        normed = self.norm1(x)
+        attn_out, _ = self.self_attn(normed, normed, normed, attn_mask=attn_mask)
+        x = x + self.dropout1(attn_out)
+
+        # Pre-Norm SwiGLU FFN
+        normed = self.norm2(x)
+        ffn_out = self.swiglu(normed)
+        x = x + self.dropout2(ffn_out)
+        return x
+
+
+# ============================================
+# Vocab Constraint (Hard Mask + Soft Penalty + Centroid)
+# ============================================
 class VocabConstraint(nn.Module):
     """禁忌词汇约束（Hard Mask + Soft Penalty + Centroid）"""
     def __init__(self, config: AttackFormerConfig):
@@ -104,8 +188,14 @@ class VocabConstraint(nn.Module):
         return torch.clamp(1 - cos_sim, min=0.0)
 
 
+# ============================================
+# Guard-Driven Cross Attention (Q=Guard Label, KV=Prompt)
+# ============================================
 class GuardDrivenCrossAttention(nn.Module):
-    """Guard驱动的跨注意力（支持多轮信号累积）"""
+    """Guard驱动的跨注意力（支持多轮信号累积）
+
+    手稿设计: Query = Guard Label/Notes, Key/Value = Prompt Embedding
+    """
     def __init__(self, config: AttackFormerConfig):
         super().__init__()
         self.embed_dim = config.embed_dim
@@ -118,20 +208,36 @@ class GuardDrivenCrossAttention(nn.Module):
         self.out_proj = nn.Linear(config.embed_dim, config.embed_dim)
         self.scale = math.sqrt(self.head_dim)
 
+        # 信号门控：融合当前 Guard 信号与历史信号
         self.signal_gate = nn.Sequential(
             nn.Linear(config.embed_dim * 2, config.embed_dim),
             nn.Sigmoid()
         )
 
-    def forward(self, guard_signal, prompt_emb, prev_guard_signal=None):
+    def forward(self, guard_label, prompt_emb, prev_guard_signal=None):
+        """
+        Args:
+            guard_label: (B, D) Guard 输出的 label/notes 嵌入
+            prompt_emb: (B, S, D) Prompt 的 token 嵌入 (作为 KV)
+            prev_guard_signal: (B, D) 前一轮累积的 Guard 信号
+        Returns:
+            out: (B, S, D) 交叉注意力输出
+            attn_weights: (B, num_heads, S, S) 注意力权重
+            accumulated_signal: (B, D) 累积后的 Guard 信号
+        """
         B, S, D = prompt_emb.shape
-        if prev_guard_signal is not None and self.training:
-            gate = self.signal_gate(torch.cat([guard_signal, prev_guard_signal], dim=-1))
-            accumulated_signal = gate * guard_signal + (1 - gate) * prev_guard_signal
-        else:
-            accumulated_signal = guard_signal
 
+        # 信号累积门控
+        if prev_guard_signal is not None and self.training:
+            gate = self.signal_gate(torch.cat([guard_label, prev_guard_signal], dim=-1))
+            accumulated_signal = gate * guard_label + (1 - gate) * prev_guard_signal
+        else:
+            accumulated_signal = guard_label
+
+        # 扩展 Guard 信号到序列长度
         guard_expanded = accumulated_signal.unsqueeze(1).expand(B, S, D)
+
+        # Multi-Head Cross Attention: Q=Guard, KV=Prompt
         Q = self.W_q(guard_expanded).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         K = self.W_k(prompt_emb).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
         V = self.W_v(prompt_emb).view(B, S, self.num_heads, self.head_dim).transpose(1, 2)
@@ -144,8 +250,11 @@ class GuardDrivenCrossAttention(nn.Module):
         return out, attn_weights, accumulated_signal
 
 
+# ============================================
+# Iterative Inductive Diffusion (使用 SwiGLU)
+# ============================================
 class IterativeInductiveDiffusion(nn.Module):
-    """迭代式诱导性扩散"""
+    """迭代式诱导性扩散 —— 内部使用 SwiGLU Transformer Layer"""
     def __init__(self, config: AttackFormerConfig):
         super().__init__()
         self.config = config
@@ -160,12 +269,10 @@ class IterativeInductiveDiffusion(nn.Module):
             nn.Linear(config.embed_dim * 2, 1),
             nn.Sigmoid()
         )
+
+        # 使用 SwiGLU 版本的 Transformer Layer (替换标准 GELU)
         self.layers = nn.ModuleList([
-            nn.TransformerEncoderLayer(
-                d_model=config.embed_dim, nhead=config.num_heads,
-                dim_feedforward=config.ff_dim, dropout=0.1,
-                activation='gelu', batch_first=True, norm_first=True
-            ) for _ in range(config.num_layers)
+            SwiGLUTransformerLayer(config) for _ in range(config.num_layers)
         ])
         self.output_norm = nn.LayerNorm(config.embed_dim)
 
@@ -184,19 +291,20 @@ class IterativeInductiveDiffusion(nn.Module):
                 else:
                     prev_h = prev_h[:, :S, :]
 
-            # 计算门控值，并确保形状为 (B, 1, 1) 用于广播
+            # 计算门控值 (B, 1, 1)
             gate_input = torch.cat([x.mean(dim=1), prev_h.mean(dim=1)], dim=-1)  # (B, 2D)
             gate = self.iter_gate(gate_input)  # (B, 1)
-            gate = gate.view(B, 1, 1)          # (B, 1, 1)
+            gate = gate.view(B, 1, 1)
 
             # 门控融合
             h = gate * (x + t_emb + g_induce) + (1 - gate) * prev_h
         else:
             h = x + t_emb + g_induce
 
-        # 通过 Transformer 层
+        # 通过 SwiGLU Transformer 层
         for layer in self.layers:
             h = layer(h)
+            # 自适应残差连接 (随迭代衰减)
             residual_weight = max(0.3, 0.5 - iteration * 0.05)
             h = (1 - residual_weight) * h + residual_weight * original_emb
 
@@ -204,6 +312,9 @@ class IterativeInductiveDiffusion(nn.Module):
         return h
 
 
+# ============================================
+# Semantic Anchor
+# ============================================
 class SemanticAnchor(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -221,30 +332,126 @@ class SemanticAnchor(nn.Module):
         return (1 - sim).mean()
 
 
-class AttackFormer(nn.Module):
-    """AttackFormer最终版（Scaling迭代式Guard增强）"""
+# ============================================
+# TOKEN MIX JAIL (核心模块)
+# ============================================
+class TokenMixJail(nn.Module):
+    """
+    TokenMixJail: 核心对抗提示生成模块
+
+    手稿架构: CrossAttention → InductiveDiffusion → SwiGLU → Tokenize
+
+    输入:
+      - prompt_emb: (B, S, D) 原始 prompt 的嵌入
+      - guard_label: (B, D) Guard 输出的 label/notes 嵌入 (作为 Query)
+      - time_step: (B,) 扩散时间步
+    输出:
+      - logits: (B, S, vocab_size) 词汇分布
+      - hidden_states: (B, S, D) 隐藏状态
+    """
     def __init__(self, config: AttackFormerConfig):
         super().__init__()
         self.config = config
-        self.token_embedding = nn.Embedding(config.vocab_size, config.embed_dim)
-        self.pos_embedding = nn.Embedding(config.max_seq_len, config.embed_dim)
-        self.vocab_constraint = VocabConstraint(config)
+
+        # 1. Guard-driven Cross Attention (Q=Guard Label, KV=Prompt)
         self.guard_attention = GuardDrivenCrossAttention(config)
+
+        # 2. Iterative Inductive Diffusion (使用 SwiGLU Transformer)
         self.inductive_diffusion = IterativeInductiveDiffusion(config)
+
+        # 3. SwiGLU Activation (额外增强层)
+        self.swiglu = SwiGLU(config)
+        self.swiglu_norm = nn.LayerNorm(config.embed_dim)
+
+        # 4. Output Projection → Tokenize
         self.output_proj = nn.Linear(config.embed_dim, config.embed_dim)
         self.final_norm = nn.LayerNorm(config.embed_dim)
         self.lm_head = nn.Linear(config.embed_dim, config.vocab_size, bias=False)
+
+    def forward(self, prompt_emb, guard_label, time_step, 
+                iteration=0, prev_h=None, original_emb=None):
+        """
+        Args:
+            prompt_emb: (B, S, D) Prompt 嵌入 (作为 CrossAttn 的 KV)
+            guard_label: (B, D) Guard Label/Notes 嵌入 (作为 CrossAttn 的 Q)
+            time_step: (B,) 扩散时间步
+            iteration: int 当前迭代轮次
+            prev_h: (B, S, D) 前一轮隐藏状态
+            original_emb: (B, S, D) 原始嵌入 (用于残差)
+        """
+        if original_emb is None:
+            original_emb = prompt_emb.clone()
+
+        # Step 1: Guard-driven Cross Attention
+        # Q=guard_label, KV=prompt_emb
+        context, attn_weights, acc_signal = self.guard_attention(
+            guard_signal=guard_label, 
+            prompt_emb=prompt_emb,
+            prev_guard_signal=None  # 外部处理累积
+        )
+        x = prompt_emb + context  # 残差连接
+
+        # Step 2: Iterative Inductive Diffusion (SwiGLU Transformer Layers)
+        h = self.inductive_diffusion(
+            x, time_step, acc_signal, original_emb,
+            iteration=iteration, prev_h=prev_h
+        )
+
+        # Step 3: SwiGLU Activation (额外非线性增强)
+        h = self.swiglu_norm(h + self.swiglu(h))
+
+        # Step 4: Output Projection + Tokenize
+        h = self.output_proj(h)
+        h = self.final_norm(h)
+        logits = self.lm_head(h)
+
+        return {
+            'logits': logits,
+            'hidden_states': h,
+            'cross_attn_weights': attn_weights,
+            'accumulated_guard_signal': acc_signal
+        }
+
+
+# ============================================
+# AttackFormer 最终版 (TokenMixJail-Centric)
+# ============================================
+class AttackFormer(nn.Module):
+    """AttackFormer: TokenMixJail-Centric Architecture
+
+    数据流:
+      Input → Embedding → [TokenMixJail × N] → VocabConstraint → Output
+                    ↑__________|
+                    Guard Feedback (prompt_emb + notes_emb)
+    """
+    def __init__(self, config: AttackFormerConfig):
+        super().__init__()
+        self.config = config
+
+        # 输入嵌入
+        self.token_embedding = nn.Embedding(config.vocab_size, config.embed_dim)
+        self.pos_embedding = nn.Embedding(config.max_seq_len, config.embed_dim)
+
+        # 词汇约束 (侧边模块)
+        self.vocab_constraint = VocabConstraint(config)
+
+        # === 核心: TokenMixJail ===
+        self.token_mix_jail = TokenMixJail(config)
+        # 绑定权重 (LM Head 与 Token Embedding 共享)
+        self.token_mix_jail.lm_head.weight = self.token_embedding.weight
+
+        # 语义锚点
         self.semantic_anchor = SemanticAnchor(config)
+
+        # Value Head (PPO Critic)
         self.value_head = nn.Sequential(
             nn.Linear(config.embed_dim, config.embed_dim // 2),
             nn.ReLU(),
             nn.Linear(config.embed_dim // 2, 1)
         )
-        self.lm_head.weight = self.token_embedding.weight
 
     def embed_tokens(self, token_ids):
         B, S = token_ids.shape
-        # 限制位置索引不超过 max_seq_len - 1
         positions = torch.arange(S, device=token_ids.device).unsqueeze(0).expand(B, S)
         positions = torch.clamp(positions, max=self.config.max_seq_len - 1)
         return self.token_embedding(token_ids) + self.pos_embedding(positions)
@@ -252,53 +459,70 @@ class AttackFormer(nn.Module):
     def forward(self, input_ids, forbidden_token_ids, guard_signal,
                 time_step=None, original_ids=None, return_value=False,
                 prev_guard_signal=None, iteration=0, prev_h=None):
+        """
+        标准前向传播 (单步)
+
+        Args:
+            input_ids: (B, S) 输入 token IDs
+            forbidden_token_ids: (B, S) 禁忌词 IDs
+            guard_signal: (B, D) Guard Label/Notes 嵌入
+            time_step: (B,) 扩散时间步
+            original_ids: (B, S) 原始 prompt IDs (用于语义损失)
+            return_value: bool 是否返回 value
+            prev_guard_signal: (B, D) 前一轮 Guard 信号
+            iteration: int 当前迭代轮次
+            prev_h: (B, S, D) 前一轮隐藏状态
+        """
         B, S = input_ids.shape
         device = input_ids.device
 
+        # 1. Embedding
         x = self.embed_tokens(input_ids)
         original_emb = x.clone()
 
-        context, attn_weights, acc_signal = self.guard_attention(
-            guard_signal, x, prev_guard_signal
-        )
-        x = x + context
-
-        if time_step is None:
-            time_step = torch.zeros(B, dtype=torch.long, device=device)
-
-        h = self.inductive_diffusion(
-            x, time_step, acc_signal, original_emb,
-            iteration=iteration, prev_h=prev_h
+        # 2. TokenMixJail (核心模块)
+        outputs = self.token_mix_jail(
+            prompt_emb=x,
+            guard_label=guard_signal,
+            time_step=time_step if time_step is not None else torch.zeros(B, dtype=torch.long, device=device),
+            iteration=iteration,
+            prev_h=prev_h,
+            original_emb=original_emb
         )
 
-        h = self.output_proj(h)
-        h = self.final_norm(h)
-        logits = self.lm_head(h)
+        logits = outputs['logits']
+        h = outputs['hidden_states']
+
+        # 3. 应用 Hard Mask (词汇约束)
         logits = self.vocab_constraint.apply_hard_mask(logits)
 
-        outputs = {
+        # 4. 组装输出
+        result = {
             'logits': logits,
             'hidden_states': h,
-            'cross_attn_weights': attn_weights,
-            'accumulated_guard_signal': acc_signal
+            'cross_attn_weights': outputs['cross_attn_weights'],
+            'accumulated_guard_signal': outputs['accumulated_guard_signal']
         }
 
+        # 5. 语义损失
         if original_ids is not None:
             with torch.no_grad():
                 orig_emb = self.embed_tokens(original_ids)
             semantic_loss = self.semantic_anchor(orig_emb, h)
-            outputs['semantic_loss'] = semantic_loss
+            result['semantic_loss'] = semantic_loss
 
+        # 6. Soft Penalty & Forbidden Distance
         soft_penalty = self.vocab_constraint.compute_soft_penalty(h)
-        outputs['soft_penalty'] = soft_penalty
+        result['soft_penalty'] = soft_penalty
         forbidden_dist = self.vocab_constraint.compute_forbidden_distance(h)
-        outputs['forbidden_distance'] = forbidden_dist
+        result['forbidden_distance'] = forbidden_dist
 
+        # 7. Value (PPO)
         if return_value:
             value = self.value_head(h[:, 0, :])
-            outputs['value'] = value.squeeze(-1)
+            result['value'] = value.squeeze(-1)
 
-        return outputs
+        return result
 
     def iterative_generate(
         self,
@@ -311,34 +535,73 @@ class AttackFormer(nn.Module):
         max_iterations=3,
         return_all_iterations=False,
         tokenizer=None,
-        forbidden_word_lists=None  # 可选：每个样本的禁忌词列表，用于动态注入Guard
+        forbidden_word_lists=None
     ):
+        """
+        迭代式生成 (×N 外层循环)
+
+        手稿流程: Guard → TokenMixJail → SwiGLU → Tokenize (×N)
+
+        每轮迭代:
+          1. Guard 评估当前 prompt → 输出 prompt_emb + notes_emb(label)
+          2. TokenMixJail 使用 notes_emb 作为 Query 生成下一 token
+          3. 累积生成序列
+          4. 下一轮使用新生成的 prompt 重新评估 Guard
+        """
         if max_length is None:
             max_length = self.config.max_seq_len
         B = original_ids.shape[0]
         device = original_ids.device
         all_iterations = []
+
+        # 初始 prompt 嵌入
         current_ids = original_ids.clone()
+        current_emb = self.embed_tokens(current_ids)
         prev_guard_signal = None
         prev_h = None
 
         for iteration in range(max_iterations):
-            step_guard = torch.zeros(B, self.config.embed_dim, device=device) if prev_guard_signal is None else prev_guard_signal
+            # === Step 1: Guard Evaluation ===
+            with torch.no_grad():
+                gen_emb = self.embed_tokens(current_ids)
+                # Guard 评估当前生成的 prompt
+                if hasattr(guard, 'evaluate') and 'forbidden_word_lists' in guard.evaluate.__code__.co_varnames:
+                    guard_out = guard.evaluate(current_ids, gen_emb, forbidden_word_lists=forbidden_word_lists)
+                else:
+                    guard_out = guard.evaluate(current_ids, gen_emb)
+
+                # 提取 Guard 双输出:
+                # - notes_emb: 给 Cross Attention 做 Query (Label)
+                # - prompt_emb: 用于下一步迭代的 prompt 表示
+                guard_label = guard_out['notes_emb']
+                guard_prompt = guard_out.get('prompt_emb', current_emb)
+                safe_conf = guard_out['safe_confidence']
+                harm_conf = guard_out['harm_confidence']
+                predicted_label = guard_out['predicted_label']
+
+            # === Step 2: TokenMixJail Generation ===
+            step_guard = guard_label
             generated = current_ids.clone()
             log_probs = []
+            iter_prev_h = prev_h
 
             for step in range(self.config.diffusion_steps):
                 t = torch.full((B,), step, dtype=torch.long, device=device)
-                outputs = self.forward(
-                    generated, forbidden_token_ids, step_guard,
-                    time_step=t, original_ids=None,
-                    prev_guard_signal=prev_guard_signal,
-                    iteration=iteration,
-                    prev_h=prev_h
-                )
-                logits = outputs['logits'][:, -1, :] / temperature
-                prev_h = outputs['hidden_states']
 
+                # TokenMixJail: 使用 guard_label 作为 Query, guard_prompt 作为 KV
+                outputs = self.token_mix_jail(
+                    prompt_emb=guard_prompt,      # KV source (来自 Guard 的 prompt_emb)
+                    guard_label=step_guard,         # Q source (来自 Guard 的 notes_emb)
+                    time_step=t,
+                    iteration=iteration,
+                    prev_h=iter_prev_h,
+                    original_emb=self.embed_tokens(original_ids)
+                )
+
+                logits = outputs['logits'][:, -1, :] / temperature
+                iter_prev_h = outputs['hidden_states']
+
+                # Top-p 采样
                 probs = F.softmax(logits, dim=-1)
                 sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
                 cumsum = torch.cumsum(sorted_probs, dim=-1)
@@ -357,26 +620,15 @@ class AttackFormer(nn.Module):
 
             log_probs = torch.stack(log_probs, dim=1)
 
-            # 调用 Guard 评估
-            with torch.no_grad():
-                gen_emb = self.embed_tokens(generated)
-                # 如果 Guard 支持 forbidden_word_lists 参数则传入
-                if hasattr(guard, 'evaluate') and 'forbidden_word_lists' in guard.evaluate.__code__.co_varnames:
-                    guard_out = guard.evaluate(generated, gen_emb, forbidden_word_lists=forbidden_word_lists)
-                else:
-                    guard_out = guard.evaluate(generated, gen_emb)
-                safe_conf = guard_out['safe_confidence']
-                harm_conf = guard_out['harm_confidence']
-                predicted_label = guard_out['predicted_label']
-                guard_notes = guard_out['notes_emb']
-
+            # 记录本轮结果
             iter_result = {
                 'generated_ids': generated,
                 'log_probs': log_probs,
                 'safe_conf': safe_conf,
                 'harm_conf': harm_conf,
                 'predicted_label': predicted_label,
-                'guard_notes': guard_notes,
+                'guard_notes': guard_label,
+                'guard_prompt': guard_prompt,
                 'iteration': iteration
             }
 
@@ -388,14 +640,21 @@ class AttackFormer(nn.Module):
                 iter_result['texts'] = texts
 
             all_iterations.append(iter_result)
-            prev_guard_signal = guard_notes
+
+            # 更新下一轮输入
+            prev_guard_signal = guard_label
+            prev_h = iter_prev_h
+            current_ids = generated
+            current_emb = self.embed_tokens(current_ids)
+
+            # 提前终止: 所有样本都通过 Guard (safe_conf > 0.9)
             if (safe_conf > 0.9).all():
                 break
-            current_ids = generated
 
         if return_all_iterations:
             return all_iterations
         else:
+            # 选择最佳迭代: max(safe_conf - harm_conf)
             best_idx = max(range(len(all_iterations)),
                           key=lambda i: all_iterations[i]['safe_conf'].mean()
                           - all_iterations[i]['harm_conf'].mean())
@@ -404,6 +663,7 @@ class AttackFormer(nn.Module):
     def generate_adversarial(self, original_ids, forbidden_token_ids, guard_signal,
                             max_length=128, temperature=1.0, top_p=0.9,
                             return_text=False, tokenizer=None):
+        """单次生成（非迭代，用于快速推理）"""
         B = original_ids.shape[0]
         device = original_ids.device
         generated = original_ids.clone()
@@ -445,20 +705,24 @@ class AttackFormer(nn.Module):
 # 真实 XGuard 模型加载器（支持本地路径）
 # ============================================
 class RealXGuardModel:
-    """加载 YuFeng-XGuard-Reason-8B 并封装为 Guard 接口"""
+    """加载 YuFeng-XGuard-Reason-8B 并封装为 Guard 接口
+
+    修改: 双输出结构
+      - notes_emb: (B, D) 给 Cross Attention 做 Query (Label)
+      - prompt_emb: (B, S, D) 用于下一步迭代的 prompt 表示
+    """
     def __init__(self, config: AttackFormerConfig):
         self.config = config
         self.device = config.xguard_device
         try:
             from modelscope import AutoModelForCausalLM, AutoTokenizer
             model_path = config.xguard_model_name_or_path
-            
-            # 确定使用的数据类型（与模型一致）
+
             if torch.cuda.is_bf16_supported():
                 self.dtype = torch.bfloat16
             else:
                 self.dtype = torch.float16
-                
+
             self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_path,
@@ -466,17 +730,17 @@ class RealXGuardModel:
                 device_map="auto",
                 trust_remote_code=True
             ).eval()
-            
+
             self.id2risk = self.tokenizer.init_kwargs.get('id2risk', {})
             hidden_size = self.model.config.hidden_size
-            
+
             # 投影层：将 Guard 隐层维度映射到 AttackFormer 的 embed_dim
-            # 显式指定 dtype 和设备，确保与模型一致
             self.notes_proj = nn.Linear(
-                hidden_size, 
-                config.embed_dim, 
-                dtype=self.dtype, 
-                device=self.device
+                hidden_size, config.embed_dim, dtype=self.dtype, device=self.device
+            )
+            # 新增: prompt 投影层 (用于生成下一步的 prompt_emb)
+            self.prompt_proj = nn.Linear(
+                hidden_size, config.embed_dim, dtype=self.dtype, device=self.device
             )
         except ImportError:
             raise ImportError("Please install modelscope: pip install modelscope")
@@ -514,14 +778,19 @@ class RealXGuardModel:
             parsed = self._parse_output(outputs, inputs['input_ids'].shape[1])
             results.append(parsed)
 
-        # 合并 batch 结果，并对 notes_emb 进行类型对齐和投影
+        # 合并 batch 结果
         batch_result = {
             'safe_confidence': torch.cat([r['safe_confidence'] for r in results], dim=0),
             'harm_confidence': torch.cat([r['harm_confidence'] for r in results], dim=0),
             'predicted_label': torch.cat([r['predicted_label'] for r in results], dim=0),
-            # 关键修正：先转换到模型 dtype 再投影，最后可转为 float32 供后续使用
+            # notes_emb: 给 Cross Attention 做 Query (Label)
             'notes_emb': torch.cat([
                 self.notes_proj(r['notes_emb'].to(self.dtype)).float() 
+                for r in results
+            ], dim=0),
+            # 新增: prompt_emb 用于下一步迭代
+            'prompt_emb': torch.cat([
+                self.prompt_proj(r['prompt_emb'].to(self.dtype)).float() 
                 for r in results
             ], dim=0),
             'explanation': [r['explanation'] for r in results]
@@ -554,13 +823,19 @@ class RealXGuardModel:
 
         hidden_states = outputs.hidden_states[-1]
         last_layer_hidden = hidden_states[-1]
-        notes_emb = last_layer_hidden[:, -1, :]  # 保持原始 dtype
+
+        # notes_emb: 最后一层最后一个 token 的 hidden state (作为 Label)
+        notes_emb = last_layer_hidden[:, -1, :]
+
+        # prompt_emb: 最后一层所有输入 token 的 mean pooling (作为 Prompt 表示)
+        prompt_emb = last_layer_hidden[:, :input_length, :].mean(dim=1)
 
         return {
             'safe_confidence': torch.tensor([safe_conf], device=self.device),
             'harm_confidence': torch.tensor([harm_conf], device=self.device),
             'predicted_label': torch.tensor([predicted_label], device=self.device),
-            'notes_emb': notes_emb.to(self.device),  # 不在这里投影，避免重复
+            'notes_emb': notes_emb.to(self.device),
+            'prompt_emb': prompt_emb.to(self.device),
             'explanation': response
         }
 
@@ -575,6 +850,8 @@ class MockGuard(nn.Module):
         self.safe_classifier = nn.Linear(embed_dim, 1)
         self.risk_classifier = nn.Linear(embed_dim, num_risk_categories)
         self.notes_proj = nn.Linear(embed_dim, embed_dim)
+        # 新增: prompt 投影
+        self.prompt_proj = nn.Linear(embed_dim, embed_dim)
 
     def evaluate(self, token_ids, embeddings):
         B = token_ids.shape[0]
@@ -585,11 +862,14 @@ class MockGuard(nn.Module):
         harm_conf = risk_probs[:, 1:].max(dim=-1)[0]
         predicted_label = (safe_conf < 0.5).long()
         notes_emb = self.notes_proj(pooled)
+        # 新增: prompt_emb (使用序列 mean pooling)
+        prompt_emb = self.prompt_proj(pooled)
         return {
             'safe_confidence': safe_conf,
             'harm_confidence': harm_conf,
             'predicted_label': predicted_label,
             'notes_emb': notes_emb,
+            'prompt_emb': prompt_emb,  # 新增
             'explanation': ['mock'] * B
         }
 
@@ -605,7 +885,7 @@ def create_guard(config: AttackFormerConfig) -> Any:
 
 
 # ============================================
-# 奖励函数与解析器
+# 奖励函数与解析器 (保持不变)
 # ============================================
 class AdaptiveRewardWeights(nn.Module):
     def __init__(self, num_components=5, init_weights=None, min_weight=0.05):
@@ -644,6 +924,7 @@ class GuardOutputParser:
                 'harm_confidence': torch.zeros(batch_size or 1, device=device),
                 'predicted_label': torch.zeros(batch_size or 1, device=device),
                 'notes_emb': guard_output,
+                'prompt_emb': guard_output,  # 新增
                 'explanation': []
             }
 
@@ -655,11 +936,13 @@ class GuardOutputParser:
             harm_conf = output['harm_confidence'] if isinstance(output['harm_confidence'], torch.Tensor) else torch.tensor([output['harm_confidence']] * B, device=device)
             predicted = output.get('predicted_label', (safe_conf < 0.5).long())
             notes_emb = output.get('notes_emb', torch.zeros(B, 512, device=device))
+            prompt_emb = output.get('prompt_emb', torch.zeros(B, 512, device=device))  # 新增
             return {
                 'safe_confidence': safe_conf,
                 'harm_confidence': harm_conf,
                 'predicted_label': predicted,
                 'notes_emb': notes_emb,
+                'prompt_emb': prompt_emb,  # 新增
                 'explanation': output.get('explanation', [])
             }
         token_score = output.get('token_score', {})
@@ -671,6 +954,7 @@ class GuardOutputParser:
             'harm_confidence': torch.full((B,), harm_conf, device=device),
             'predicted_label': torch.full((B,), predicted, device=device, dtype=torch.long),
             'notes_emb': output.get('notes_emb', torch.zeros(B, 512, device=device)),
+            'prompt_emb': output.get('prompt_emb', torch.zeros(B, 512, device=device)),  # 新增
             'explanation': output.get('explanation', [])
         }
 

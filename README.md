@@ -226,7 +226,7 @@ print(tokenizer.decode(generated_ids[0]))
 
 
 ## Ways to Guard
-To avoid these kind of stealthy attack, reduce the propability of tthe assumptions that the secure limit of the Guard aligned with the LLM itself,from which make the assumption of guard and llm itself originated from the same distribution,or innovating a new aspect of llm downstreaming method.
+To avoid these kind of stealthy attack, reduce the propability of the assumptions that the secure limit of the Guard aligned with the LLM itself,from which make the assumption of guard and llm itself originated from the same distribution,or innovating a new aspect of llm downstreaming method.
 
 ## Citation
 

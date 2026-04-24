@@ -1,4 +1,4 @@
-# AttackFormer: Forbidden-Aware Adversarial Generation
+# AttackFormer: Guard Signal Guidance is All You Need
 
 ## Research Motivation
 

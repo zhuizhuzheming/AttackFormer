@@ -1,5 +1,6 @@
 # AttackFormer: Guard Signal Guidance is All You Need
 
+Link:https://sandbox.zenodo.org/records/492828
 ## Research Motivation
 
 Modern large language models (LLMs) have achieved remarkable capabilities across diverse tasks, yet their safety alignment remains vulnerable to adversarial prompt attacks. Existing red-teaming methods are often limited by poor scalability, lack of iterative feedback, and insufficient semantic coherence. More critically, the rise of open-source guard models introduces a novel and understudied vulnerability: since many safety guard systems (e.g., XGuard) are trained from the same model architecture and distribution as the protected LLM (e.g., Qwen), they may inadvertently leak implicit decision boundaries that can be exploited to probe and evade safety controls.

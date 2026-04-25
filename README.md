@@ -234,7 +234,9 @@ To avoid these kind of stealthy attack, reduce the propability of the assumption
 If you use this code, please cite:
 
 ```bibtex
-@article{attackformer2026,
+@article{
+  attackformer2026,
+  title={AttackFormer: Guard Signal Guidance is All You Need}
   author={xujiahao}
   title={AttackFormer: Forbidden-Aware Adversarial Generation via Hybrid RL-Diffusion},
   year={2026}
